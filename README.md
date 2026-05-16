@@ -10,6 +10,7 @@ container CLIs.
 ## Contents
 
 - `go/` - Go module and dependency retrieval without invoking the Go toolchain.
+- `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
 
@@ -20,6 +21,12 @@ See [go/README.md](go/README.md) for examples and limitations.
 ## Rust
 
 See [rust/README.md](rust/README.md) for examples and limitations.
+
+## npm
+
+See [npm/README.md](npm/README.md) for examples and limitations.
+The npm directory also includes `Test-NpmPackageSample.ps1`, which randomly
+tests five packages from a checked-in popular-package sample list.
 
 ## Podman Pull Replacement
 
