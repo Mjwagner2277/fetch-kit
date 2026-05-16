@@ -1,4 +1,4 @@
-# Airgap Fetch Kit
+# Fetch Kit
 
 PowerShell-first retrieval scripts for constrained or air-gapped environments
 where the usual toolchain is unavailable, restricted, or intentionally avoided.
@@ -10,12 +10,16 @@ container CLIs.
 ## Contents
 
 - `go/` - Go module and dependency retrieval without invoking the Go toolchain.
+- `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
 
 Planned areas:
 
-- `rust/` - Cargo crate retrieval without invoking Cargo.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, or ORAS.
 
 ## Go
 
 See [go/README.md](go/README.md) for examples and limitations.
+
+## Rust
+
+See [rust/README.md](rust/README.md) for examples and limitations.
