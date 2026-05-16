@@ -80,6 +80,14 @@ $env:CARGO_REGISTRY_TOKEN = "your-token"
   -BearerToken $env:CARGO_REGISTRY_TOKEN
 ```
 
+Run a five-crate random sample from the committed candidate list:
+
+```powershell
+.\rust\Test-RustCrateSample.ps1 `
+  -SampleSize 5 `
+  -SkipTargetSpecificDependencies
+```
+
 ## Output
 
 By default the script writes to:
@@ -213,6 +221,13 @@ exact platform-aware feature unification.
 - `-SkipTargetSpecificDependencies`: skip dependencies with a non-null target.
 - `-BearerToken`: bearer token for private registries.
 - `-Expand`: extract downloaded `.crate` archives with `tar`.
+
+## Sample Test Harness
+
+`Test-RustCrateSample.ps1` contains a curated list of roughly 100 common crates
+and randomly selects five by default. It runs `Get-RustCrate.ps1` for each
+selected crate, writes per-crate logs, stores `sample.json`, `results.json`, and
+`summary.json`, and downloads crate archives into `crate-cache-sample`.
 
 ## Notes For Air-Gapped Use
 
