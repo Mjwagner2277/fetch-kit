@@ -191,7 +191,7 @@ function Invoke-Json {
     if (-not $response.Content) {
         return $null
     }
-    return $response.Content | ConvertFrom-Json
+    return (ConvertTo-ResponseText -Content $response.Content) | ConvertFrom-Json
 }
 
 function ConvertTo-ResponseText {
@@ -201,6 +201,128 @@ function ConvertTo-ResponseText {
         return [System.Text.Encoding]::UTF8.GetString($Content)
     }
     return [string]$Content
+}
+
+function ConvertTo-ResponseBytes {
+    param([AllowNull()]$Content)
+
+    if ($null -eq $Content) {
+        return [byte[]]::new(0)
+    }
+    if ($Content -is [byte[]]) {
+        return [byte[]]$Content
+    }
+    return [System.Text.Encoding]::UTF8.GetBytes([string]$Content)
+}
+
+function Get-HashAlgorithm {
+    param([Parameter(Mandatory = $true)][string]$Algorithm)
+
+    switch ($Algorithm.ToLowerInvariant()) {
+        'sha256' { return [System.Security.Cryptography.SHA256]::Create() }
+        'sha384' { return [System.Security.Cryptography.SHA384]::Create() }
+        'sha512' { return [System.Security.Cryptography.SHA512]::Create() }
+        default { throw "Unsupported digest algorithm: $Algorithm" }
+    }
+}
+
+function ConvertTo-HexString {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+    $builder = [System.Text.StringBuilder]::new($Bytes.Length * 2)
+    foreach ($byte in $Bytes) {
+        [void]$builder.Append($byte.ToString('x2'))
+    }
+    return $builder.ToString()
+}
+
+function Get-DigestFromBytes {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [string]$Algorithm = 'sha256'
+    )
+
+    $hasher = Get-HashAlgorithm -Algorithm $Algorithm
+    try {
+        return "${Algorithm}:" + (ConvertTo-HexString -Bytes $hasher.ComputeHash($Bytes))
+    }
+    finally {
+        $hasher.Dispose()
+    }
+}
+
+function Get-DigestFromFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Algorithm
+    )
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $hasher = Get-HashAlgorithm -Algorithm $Algorithm
+    try {
+        return "${Algorithm}:" + (ConvertTo-HexString -Bytes $hasher.ComputeHash($stream))
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
+function Test-FileDigest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Digest
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+    if ($Digest -notmatch '^([^:]+):(.+)$') {
+        throw "Unsupported digest format: $Digest"
+    }
+
+    return (Get-DigestFromFile -Path $Path -Algorithm $Matches[1]) -eq $Digest
+}
+
+function Get-HeaderValue {
+    param(
+        [Parameter(Mandatory = $true)]$Headers,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($Headers -is [System.Net.WebHeaderCollection]) {
+        return [string]$Headers[$Name]
+    }
+
+    if ($Headers.PSObject.Methods['ContainsKey']) {
+        if (-not $Headers.ContainsKey($Name)) {
+            return ''
+        }
+
+        $value = $Headers[$Name]
+        if ($value -is [array]) {
+            return [string]$value[0]
+        }
+        return [string]$value
+    }
+
+    if ($Headers -is [System.Collections.IDictionary]) {
+        if (-not $Headers.Contains($Name)) {
+            return ''
+        }
+
+        $value = $Headers[$Name]
+        if ($value -is [array]) {
+            return [string]$value[0]
+        }
+        return [string]$value
+    }
+
+    if ($Headers.PSObject.Properties[$Name]) {
+        return [string]$Headers.$Name
+    }
+
+    return ''
 }
 
 function Parse-WwwAuthenticate {
@@ -255,7 +377,7 @@ function Get-RegistryAuthHeaders {
                 throw
             }
 
-            $authHeader = $response.Headers['WWW-Authenticate']
+            $authHeader = Get-HeaderValue -Headers $response.Headers -Name 'WWW-Authenticate'
             if (-not $authHeader) {
                 throw "Registry requires authentication but did not send WWW-Authenticate."
             }
@@ -308,56 +430,57 @@ function Get-BlobPath {
 function Get-DescriptorFromResponse {
     param(
         [Parameter(Mandatory = $true)]$Response,
-        [Parameter(Mandatory = $true)]$Manifest
+        [Parameter(Mandatory = $true)]$Manifest,
+        [Parameter(Mandatory = $true)][byte[]]$ContentBytes
     )
 
     $digest = ''
-    if ($Response.Headers.ContainsKey('Docker-Content-Digest')) {
-        $digest = [string]$Response.Headers['Docker-Content-Digest'][0]
+    $digest = Get-HeaderValue -Headers $Response.Headers -Name 'Docker-Content-Digest'
+    if (-not $digest) {
+        $digest = Get-DigestFromBytes -Bytes $ContentBytes -Algorithm 'sha256'
     }
 
-    $mediaType = if ($Manifest.PSObject.Properties['mediaType'] -and $Manifest.mediaType) { $Manifest.mediaType } else { [string]$Response.Body.Headers['Content-Type'] }
+    $contentType = Get-HeaderValue -Headers $Response.Body.Headers -Name 'Content-Type'
+    $mediaType = if ($Manifest.PSObject.Properties['mediaType'] -and $Manifest.mediaType) { $Manifest.mediaType } else { $contentType.Split(';')[0].Trim() }
     return [pscustomobject]@{
         mediaType = $mediaType
         digest    = $digest
-        size      = [int64][System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-ResponseText -Content $Response.Body.Content))
+        size      = [int64]$ContentBytes.Length
     }
 }
 
-function Save-JsonBlob {
+function Save-ContentBlob {
     param(
         [Parameter(Mandatory = $true)][string]$LayoutRoot,
         [Parameter(Mandatory = $true)][string]$Digest,
-        [Parameter(Mandatory = $true)]$Value
+        [Parameter(Mandatory = $true)][byte[]]$ContentBytes
     )
 
     if (-not $Digest) {
-        return ''
+        throw 'Cannot save a content blob without a digest.'
     }
 
     $path = Get-BlobPath -LayoutRoot $LayoutRoot -Digest $Digest
     New-Directory -Path (Split-Path -Parent $path)
-    if (-not (Test-Path -LiteralPath $path)) {
-        $Value | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $path -Encoding UTF8
-    }
-    return $path
-}
-
-function Save-TextBlob {
-    param(
-        [Parameter(Mandatory = $true)][string]$LayoutRoot,
-        [Parameter(Mandatory = $true)][string]$Digest,
-        [Parameter(Mandatory = $true)][string]$Content
-    )
-
-    if (-not $Digest) {
-        return ''
+    if (Test-Path -LiteralPath $path) {
+        if (Test-FileDigest -Path $path -Digest $Digest) {
+            return $path
+        }
+        Write-Verbose "Replacing cached blob with digest mismatch at $path"
     }
 
-    $path = Get-BlobPath -LayoutRoot $LayoutRoot -Digest $Digest
-    New-Directory -Path (Split-Path -Parent $path)
-    if (-not (Test-Path -LiteralPath $path)) {
-        [System.IO.File]::WriteAllText($path, $Content, [System.Text.UTF8Encoding]::new($false))
+    $temporaryPath = "$path.tmp-$([System.Guid]::NewGuid().ToString('N'))"
+    try {
+        [System.IO.File]::WriteAllBytes($temporaryPath, $ContentBytes)
+        if (-not (Test-FileDigest -Path $temporaryPath -Digest $Digest)) {
+            throw "Downloaded manifest digest did not match $Digest."
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $path -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
     }
     return $path
 }
@@ -374,11 +497,26 @@ function Save-RegistryBlob {
     $path = Get-BlobPath -LayoutRoot $LayoutRoot -Digest $Digest
     New-Directory -Path (Split-Path -Parent $path)
     if (Test-Path -LiteralPath $path) {
-        return $path
+        if (Test-FileDigest -Path $path -Digest $Digest) {
+            return $path
+        }
+        Write-Verbose "Replacing cached blob with digest mismatch at $path"
     }
 
     $uri = "${script:RegistryScheme}://$Registry/v2/$Repository/blobs/$Digest"
-    Invoke-Http -Uri $uri -Headers $Headers -OutFile $path | Out-Null
+    $temporaryPath = "$path.tmp-$([System.Guid]::NewGuid().ToString('N'))"
+    try {
+        Invoke-Http -Uri $uri -Headers $Headers -OutFile $temporaryPath | Out-Null
+        if (-not (Test-FileDigest -Path $temporaryPath -Digest $Digest)) {
+            throw "Downloaded blob digest did not match $Digest."
+        }
+        Move-Item -LiteralPath $temporaryPath -Destination $path -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+    }
     return $path
 }
 
@@ -393,13 +531,18 @@ function Select-ManifestDescriptor {
     $architecture = if ($parts.Count -gt 1) { $parts[1] } else { '' }
     $variant = if ($parts.Count -gt 2) { $parts[2] } else { '' }
 
+    if (-not $Index.PSObject.Properties['manifests']) {
+        throw 'The image index did not contain a manifests array.'
+    }
+
     foreach ($manifest in @($Index.manifests)) {
-        if (-not $manifest.platform) {
+        if (-not $manifest.PSObject.Properties['platform'] -or -not $manifest.platform) {
             continue
         }
+        $manifestVariant = if ($manifest.platform.PSObject.Properties['variant']) { $manifest.platform.variant } else { '' }
         if ($manifest.platform.os -eq $os -and
             $manifest.platform.architecture -eq $architecture -and
-            (-not $variant -or $manifest.platform.variant -eq $variant)) {
+            (-not $variant -or $manifestVariant -eq $variant)) {
             return $manifest
         }
     }
@@ -411,12 +554,17 @@ function Select-ManifestDescriptor {
     throw "The image index did not contain any manifests."
 }
 
-function Test-ImageManifestList {
-    param([Parameter(Mandatory = $true)]$Manifest)
-    if (-not $Manifest.PSObject.Properties['mediaType']) {
+function Test-ImageManifestListMediaType {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$MediaType
+    )
+
+    if (-not $MediaType) {
         return $false
     }
-    return $Manifest.mediaType -in @(
+    return $MediaType -in @(
         'application/vnd.oci.image.index.v1+json',
         'application/vnd.docker.distribution.manifest.list.v2+json'
     )
@@ -438,13 +586,14 @@ function Get-RegistryManifest {
 
     $uri = "${script:RegistryScheme}://$Registry/v2/$Repository/manifests/$Reference"
     $response = Invoke-HttpWithResponse -Uri $uri -Headers $requestHeaders
+    $contentBytes = ConvertTo-ResponseBytes -Content $response.Body.Content
     $content = ConvertTo-ResponseText -Content $response.Body.Content
     $manifest = $content | ConvertFrom-Json
-    $descriptor = Get-DescriptorFromResponse -Response $response -Manifest $manifest
+    $descriptor = Get-DescriptorFromResponse -Response $response -Manifest $manifest -ContentBytes $contentBytes
     return [pscustomobject]@{
-        Manifest   = $manifest
-        Descriptor = $descriptor
-        Content    = $content
+        Manifest     = $manifest
+        Descriptor   = $descriptor
+        ContentBytes = $contentBytes
     }
 }
 
@@ -459,6 +608,8 @@ function Write-OciLayout {
         ConvertTo-Json -Depth 10 |
         Set-Content -LiteralPath (Join-Path $LayoutRoot 'oci-layout') -Encoding UTF8
 
+    $containerImageName = if ($ImageReference.Digest) { "$($ImageReference.Name)@$($ImageReference.Digest)" } else { "$($ImageReference.Name):$($ImageReference.Tag)" }
+
     $index = [pscustomobject]@{
         schemaVersion = 2
         manifests     = @(
@@ -468,7 +619,7 @@ function Write-OciLayout {
                 size        = $Descriptor.size
                 annotations = @{
                     'org.opencontainers.image.ref.name' = $ImageReference.Original
-                    'io.containerd.image.name'          = "$($ImageReference.Name):$($ImageReference.Tag)"
+                    'io.containerd.image.name'          = $containerImageName
                 }
             }
         )
@@ -492,15 +643,18 @@ function Receive-ContainerImage {
 
     $indexDescriptor = $null
     $manifestResult = $resolved
-    if (Test-ImageManifestList -Manifest $resolved.Manifest) {
+    if (Test-ImageManifestListMediaType -MediaType $resolved.Descriptor.mediaType) {
         $indexDescriptor = $resolved.Descriptor
-        Save-TextBlob -LayoutRoot $Destination -Digest $indexDescriptor.digest -Content $resolved.Content | Out-Null
+        Save-ContentBlob -LayoutRoot $Destination -Digest $indexDescriptor.digest -ContentBytes $resolved.ContentBytes | Out-Null
 
         $selected = Select-ManifestDescriptor -Index $resolved.Manifest -RequestedPlatform $Platform
+        if (-not $selected.digest) {
+            throw "Selected platform manifest did not include a digest."
+        }
         $manifestResult = Get-RegistryManifest -Registry $parsed.Registry -Repository $parsed.Repository -Reference $selected.digest -Headers $headers
     }
 
-    Save-TextBlob -LayoutRoot $Destination -Digest $manifestResult.Descriptor.digest -Content $manifestResult.Content | Out-Null
+    Save-ContentBlob -LayoutRoot $Destination -Digest $manifestResult.Descriptor.digest -ContentBytes $manifestResult.ContentBytes | Out-Null
 
     $configFile = ''
     if ($manifestResult.Manifest.PSObject.Properties['config'] -and $manifestResult.Manifest.config -and $manifestResult.Manifest.config.digest) {
@@ -509,7 +663,13 @@ function Receive-ContainerImage {
 
     $layerFiles = @()
     if (-not $SkipLayers) {
+        if (-not $manifestResult.Manifest.PSObject.Properties['layers']) {
+            throw 'Image manifest did not include a layers array.'
+        }
         foreach ($layer in @($manifestResult.Manifest.layers)) {
+            if (-not $layer.digest) {
+                throw 'Image manifest contained a layer without a digest.'
+            }
             $layerFiles += Save-RegistryBlob -Registry $parsed.Registry -Repository $parsed.Repository -Digest $layer.digest -LayoutRoot $Destination -Headers $headers
         }
     }

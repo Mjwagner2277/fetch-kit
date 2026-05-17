@@ -15,6 +15,13 @@ with PowerShell HTTP calls and writes an OCI image layout to disk.
 
 ## Examples
 
+The examples below assume your current directory is `fetch-kit/podman`. From the
+repository root, prefix script paths with `.\podman\`, for example:
+
+```powershell
+.\podman\Get-ContainerImage.ps1 -Image "alpine:3.20"
+```
+
 Pull the GitLab offline container scanning analyzer image:
 
 ```powershell
@@ -27,6 +34,14 @@ Pull a Docker Hub image using Docker-style shorthand:
 
 ```powershell
 .\Get-ContainerImage.ps1 -Image "alpine:3.20"
+```
+
+Pull by digest instead of tag:
+
+```powershell
+.\Get-ContainerImage.ps1 `
+  -Image "alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc" `
+  -SkipLayers
 ```
 
 Pull from an authenticated registry:
@@ -62,8 +77,10 @@ Each image creates an OCI image layout directory with:
 - `index.json`
 - `blobs/sha256/<digest>` entries for the selected manifest, config, and layers
 
-The script prints a JSON summary with the selected manifest digest, config path,
-downloaded layer paths, and layout path.
+The script verifies cached and newly downloaded manifest, config, and layer blobs
+against their content digests. If an existing cached blob has the wrong digest,
+it is replaced. The script prints a JSON summary with the selected manifest
+digest, config path, downloaded layer paths, and layout path.
 
 ## Tests
 
@@ -91,6 +108,13 @@ Run a random sample of five common public FOSS images:
 
 ```powershell
 .\Test-CommonFossImages.ps1
+```
+
+From the repository root, run the test scripts as:
+
+```powershell
+.\podman\Test-ContainerImagePull.ps1
+.\podman\Test-CommonFossImages.ps1
 ```
 
 ## Limitations

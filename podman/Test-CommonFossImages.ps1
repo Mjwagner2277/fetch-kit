@@ -52,6 +52,18 @@ function Assert-FileExists {
     }
 }
 
+function Get-BlobPathFromDigest {
+    param(
+        [Parameter(Mandatory = $true)][string]$LayoutPath,
+        [Parameter(Mandatory = $true)][string]$Digest
+    )
+
+    if ($Digest -notmatch '^([^:]+):(.+)$') {
+        throw "Unsupported digest format: $Digest"
+    }
+    return Join-Path (Join-Path (Join-Path $LayoutPath 'blobs') $Matches[1]) $Matches[2]
+}
+
 New-Directory -Path $OutputDirectory
 New-Directory -Path $CacheDirectory
 
@@ -127,6 +139,7 @@ foreach ($case in $sample) {
         if (-not $summary.ManifestDigest) {
             throw 'Missing selected manifest digest.'
         }
+        Assert-FileExists -Path (Get-BlobPathFromDigest -LayoutPath $summary.LayoutPath -Digest $summary.ManifestDigest) -Message 'Selected manifest blob was not written.'
         if (-not $summary.ConfigFile) {
             throw 'Missing image config blob.'
         }
