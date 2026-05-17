@@ -1,5 +1,6 @@
 go-library-cache/
 go-library-cache-sample/
 sample-results/
+sample-results*/
 *.log
 .DS_Store

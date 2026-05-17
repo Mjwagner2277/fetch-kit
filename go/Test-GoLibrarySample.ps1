@@ -1,6 +1,10 @@
 <# 
 .SYNOPSIS
 Randomly samples Go modules from index.golang.org and tests Get-GoLibrary.ps1.
+
+.DESCRIPTION
+By default, each sampled module is tested with -ResolveDependencies. Use
+-SkipResolveDependencies only when testing direct single-module retrieval.
 #>
 
 [CmdletBinding()]
@@ -9,6 +13,7 @@ param(
     [int]$BatchSize = 10,
     [string]$OutputDirectory = (Join-Path (Get-Location) 'sample-results'),
     [switch]$ResolveDependencies,
+    [switch]$SkipResolveDependencies,
     [switch]$Expand
 )
 
@@ -47,7 +52,7 @@ function ConvertTo-SafeFileName {
 
 New-Directory -Path $OutputDirectory
 
-$retriever = Join-Path (Get-Location) 'Get-GoLibrary.ps1'
+$retriever = Join-Path $PSScriptRoot 'Get-GoLibrary.ps1'
 if (-not (Test-Path -LiteralPath $retriever)) {
     throw "Could not find $retriever"
 }
@@ -68,6 +73,7 @@ $sample | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $sampleFile -Encod
 
 $results = @()
 $batchNumber = 0
+$resolveDependencyGraph = -not [bool]$SkipResolveDependencies
 
 for ($index = 0; $index -lt $sample.Count; $index += $BatchSize) {
     $batchNumber++
@@ -92,7 +98,7 @@ for ($index = 0; $index -lt $sample.Count; $index += $BatchSize) {
             (Join-Path (Get-Location) 'go-library-cache-sample')
         )
 
-        if ($ResolveDependencies) {
+        if ($resolveDependencyGraph) {
             $arguments += '-ResolveDependencies'
         }
 
@@ -127,13 +133,34 @@ $summaryFile = Join-Path $OutputDirectory 'summary.json'
 
 $results | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $resultsFile -Encoding UTF8
 
+$batchSummary = @(
+    $results |
+        Group-Object Batch |
+        ForEach-Object {
+            [pscustomobject]@{
+                Batch     = [int]$_.Name
+                Successes = @($_.Group | Where-Object { $_.Success }).Count
+                Failures  = @($_.Group | Where-Object { -not $_.Success }).Count
+            }
+        } |
+        Sort-Object Batch
+)
+
+$failedModules = @(
+    $results |
+        Where-Object { -not $_.Success } |
+        Select-Object Module, Version, ExitCode, LogFile, Error
+)
+
 $summary = [pscustomobject]@{
     SampleSize          = $SampleSize
     BatchSize           = $BatchSize
-    ResolveDependencies = [bool]$ResolveDependencies
+    ResolveDependencies = $resolveDependencyGraph
     Expand              = [bool]$Expand
     Successes           = @($results | Where-Object { $_.Success }).Count
     Failures            = @($results | Where-Object { -not $_.Success }).Count
+    BatchSummary        = $batchSummary
+    FailedModules       = $failedModules
     SampleFile          = $sampleFile
     ResultsFile         = $resultsFile
 }

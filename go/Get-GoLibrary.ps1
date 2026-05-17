@@ -777,8 +777,8 @@ function Get-SelectedModuleVersions {
     }
 
     return [pscustomobject]@{
-        Selected   = $selected | Sort-Object -Property Module, Version
-        Superseded = $superseded | Sort-Object -Property Module, Version
+        Selected   = @($selected | Sort-Object -Property Module, Version)
+        Superseded = @($superseded | Sort-Object -Property Module, Version)
     }
 }
 
@@ -908,23 +908,28 @@ function Resolve-ModuleDependencyGraph {
     }
 
     $versionSelection = Get-SelectedModuleVersions -Retrieved $retrieved
+    $selectedVersions = @($versionSelection.Selected)
+    $supersededVersions = @($versionSelection.Superseded)
+    $retrievedModules = @($retrieved)
+    $failedModules = @($failures)
+    $skippedModules = @($skipped)
 
     return [pscustomobject]@{
         Mode           = 'ModuleDependencyGraph'
         RootModule     = $RootModule
         RootVersion    = $RootVersion
-        RetrievedCount = $retrieved.Count
-        SelectedCount  = $versionSelection.Selected.Count
-        SupersededCount = $versionSelection.Superseded.Count
-        FailureCount   = $failures.Count
-        SkippedCount   = $skipped.Count
+        RetrievedCount = $retrievedModules.Count
+        SelectedCount  = $selectedVersions.Count
+        SupersededCount = $supersededVersions.Count
+        FailureCount   = $failedModules.Count
+        SkippedCount   = $skippedModules.Count
         Replacements   = $replacements
         Exclusions     = $exclusions
-        Skipped        = $skipped
-        Selected       = $versionSelection.Selected
-        Superseded     = $versionSelection.Superseded
-        Retrieved      = $retrieved
-        Failures       = $failures
+        Skipped        = $skippedModules
+        Selected       = $selectedVersions
+        Superseded     = $supersededVersions
+        Retrieved      = $retrievedModules
+        Failures       = $failedModules
     }
 }
 

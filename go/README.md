@@ -6,6 +6,11 @@ calling the Go toolchain, Git, Docker, or ORAS. It uses only PowerShell HTTP cal
 ## What It Can Retrieve
 
 - Go modules from a Go module proxy that implements the standard proxy protocol.
+- Recursive dependency graphs by reading downloaded `go.mod` files and fetching
+  required modules.
+- Root module `replace` and `exclude` directives for dependency graph retrieval.
+- Selected and superseded version summaries so repeated module requirements are
+  visible in the output.
 - Public or private GitHub repository archives through the GitHub REST API.
 - Public or private GitLab repository archives through the GitLab REST API.
 - Basic `go-import` vanity path discovery when the resolved repository is hosted
@@ -46,6 +51,19 @@ Retrieve a module and every dependency listed in the downloaded `go.mod` files:
   -Version "v1.11.0" `
   -ResolveDependencies `
   -Expand
+```
+
+Run a random 10-module retrieval test. Dependency resolution is enabled by
+default for this test workflow:
+
+```powershell
+.\Test-GoLibrarySample.ps1 -SampleSize 10 -BatchSize 5
+```
+
+Run the same random sample workflow against direct single-module retrieval only:
+
+```powershell
+.\Test-GoLibrarySample.ps1 -SampleSize 10 -BatchSize 5 -SkipResolveDependencies
 ```
 
 Use your own Go proxy chain:
@@ -133,6 +151,24 @@ Module proxy downloads save:
 When `-ResolveDependencies` is used, the script prints a dependency graph
 summary with every retrieved module, root `replace`/`exclude` directives,
 skipped local replacements, and any failures.
+
+The dependency graph summary includes:
+
+- `RetrievedCount`: every module version downloaded.
+- `SelectedCount`: the selected module set after highest-version selection.
+- `SupersededCount`: downloaded module versions that were superseded by a newer
+  version of the same module.
+- `FailureCount`: modules that could not be retrieved.
+- `SkippedCount`: modules intentionally skipped, such as local path
+  replacements that cannot be fetched over HTTP.
+
+`Test-GoLibrarySample.ps1` writes:
+
+- `sample.json`: the randomly selected modules.
+- `results.json`: one row per sampled module.
+- `summary.json`: success/failure counts, batch counts, and failed module
+  details.
+- one `.log` file per sampled module.
 
 OCI downloads save:
 
