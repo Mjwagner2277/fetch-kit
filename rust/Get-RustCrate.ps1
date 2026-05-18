@@ -44,6 +44,9 @@ param(
     [switch]$IncludeDevDependencies,
 
     [Parameter()]
+    [switch]$IncludeOptionalDependencies,
+
+    [Parameter()]
     [switch]$ExcludeBuildDependencies,
 
     [Parameter()]
@@ -596,10 +599,15 @@ function Get-ActiveFeatureSet {
 function Test-DependencyEnabled {
     param(
         [Parameter(Mandatory = $true)][object]$Dependency,
-        [object]$ActiveFeatures
+        [object]$ActiveFeatures,
+        [bool]$IsRootRecord = $false
     )
 
     if (-not $Dependency.optional) {
+        return $true
+    }
+
+    if ($IncludeOptionalDependencies -and $IsRootRecord) {
         return $true
     }
 
@@ -738,7 +746,7 @@ function Resolve-CrateGraph {
                 if ($kind -eq 'dev' -and -not $IncludeDevDependencies) { continue }
                 if ($kind -eq 'build' -and $ExcludeBuildDependencies) { continue }
                 if ($SkipTargetSpecificDependencies -and $dep.PSObject.Properties['target'] -and $dep.target) { continue }
-                if (-not (Test-DependencyEnabled -Dependency $dep -ActiveFeatures $featureSets[$key])) { continue }
+                if (-not (Test-DependencyEnabled -Dependency $dep -ActiveFeatures $featureSets[$key] -IsRootRecord ([bool]$request.Root))) { continue }
 
                 $depName = [string]$dep.name
                 if ($dep.PSObject.Properties['package'] -and $dep.package) {

@@ -88,6 +88,16 @@ Run a five-crate random sample from the committed candidate list:
   -SkipTargetSpecificDependencies
 ```
 
+Fetch every optional dependency listed on the requested root crate, even when
+the corresponding feature is not enabled:
+
+```powershell
+.\rust\Get-RustCrate.ps1 `
+  -Crate "tokio" `
+  -Version "1" `
+  -IncludeOptionalDependencies
+```
+
 ## Output
 
 By default the script writes to:
@@ -179,7 +189,8 @@ The resolver includes:
 - build dependencies by default
 - dev dependencies only with `-IncludeDevDependencies`
 - target-specific dependencies by default
-- optional dependencies only when activated by selected features
+- optional dependencies when activated by selected features, or root-crate
+  optional dependencies with `-IncludeOptionalDependencies`
 
 Feature handling is intentionally pragmatic. The script activates the root
 default feature unless `-NoDefaultFeatures` is provided, activates any root
@@ -221,6 +232,8 @@ exact platform-aware feature unification.
 - `-AllFeatures`: activate all root crate features.
 - `-NoDefaultFeatures`: do not activate the root crate's default feature.
 - `-IncludeDevDependencies`: include dev dependency edges.
+- `-IncludeOptionalDependencies`: include optional dependency edges from the
+  requested root crate even when their features are not active.
 - `-ExcludeBuildDependencies`: skip build dependency edges.
 - `-IncludeYanked`: allow yanked versions during selection.
 - `-SkipChecksumVerification`: do not compare downloads to index `cksum`.
