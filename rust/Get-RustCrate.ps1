@@ -177,17 +177,70 @@ function Read-CrateIndex {
 function ConvertTo-VersionParts {
     param([Parameter(Mandatory = $true)][string]$VersionText)
 
-    $core = ($VersionText -split '[-+]')[0]
+    $normalized = $VersionText.Trim()
+    $withoutBuild = ($normalized -split '\+')[0]
+    $core = ($withoutBuild -split '-')[0]
+    $preRelease = ''
+    if ($withoutBuild.Contains('-')) {
+        $preRelease = $withoutBuild.Substring($core.Length + 1)
+    }
+
+    if ($core -notmatch '^\d+(\.\d+){0,2}$') {
+        throw "Unsupported semver version '$VersionText'."
+    }
+
     $parts = @($core.Split('.') | ForEach-Object { [int]$_ })
     while ($parts.Count -lt 3) {
         $parts += 0
     }
     return [pscustomobject]@{
-        Major = $parts[0]
-        Minor = $parts[1]
-        Patch = $parts[2]
-        Text  = $VersionText
+        Major      = $parts[0]
+        Minor      = $parts[1]
+        Patch      = $parts[2]
+        PreRelease = $preRelease
+        Text       = $VersionText
     }
+}
+
+function Compare-PrereleaseText {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if (-not $Left -and -not $Right) { return 0 }
+    if (-not $Left) { return 1 }
+    if (-not $Right) { return -1 }
+
+    $leftParts = @($Left.Split('.'))
+    $rightParts = @($Right.Split('.'))
+    $max = [Math]::Max($leftParts.Count, $rightParts.Count)
+    for ($index = 0; $index -lt $max; $index++) {
+        if ($index -ge $leftParts.Count) { return -1 }
+        if ($index -ge $rightParts.Count) { return 1 }
+
+        $leftPart = $leftParts[$index]
+        $rightPart = $rightParts[$index]
+        $leftNumeric = $leftPart -match '^\d+$'
+        $rightNumeric = $rightPart -match '^\d+$'
+
+        if ($leftNumeric -and $rightNumeric) {
+            $leftNumber = [int]$leftPart
+            $rightNumber = [int]$rightPart
+            if ($leftNumber -lt $rightNumber) { return -1 }
+            if ($leftNumber -gt $rightNumber) { return 1 }
+            continue
+        }
+
+        if ($leftNumeric -and -not $rightNumeric) { return -1 }
+        if (-not $leftNumeric -and $rightNumeric) { return 1 }
+
+        $cmp = [string]::CompareOrdinal($leftPart, $rightPart)
+        if ($cmp -lt 0) { return -1 }
+        if ($cmp -gt 0) { return 1 }
+    }
+
+    return 0
 }
 
 function Compare-VersionText {
@@ -202,7 +255,7 @@ function Compare-VersionText {
         if ($a.$part -lt $b.$part) { return -1 }
         if ($a.$part -gt $b.$part) { return 1 }
     }
-    return [string]::CompareOrdinal($Left, $Right)
+    return Compare-PrereleaseText -Left $a.PreRelease -Right $b.PreRelease
 }
 
 function Test-VersionAtLeast {
@@ -253,7 +306,7 @@ function Test-SingleRequirement {
     }
 
     if ($req.Contains('*') -or $req.Contains('x') -or $req.Contains('X')) {
-        $segments = @($req.TrimStart('=').Split('.'))
+        $segments = @(($req -replace '^(=|~|\^)\s*', '').Split('.'))
         $version = ConvertTo-VersionParts -VersionText $VersionText
         if ($segments.Count -ge 1 -and $segments[0] -notmatch '^[*xX]$' -and $version.Major -ne [int]$segments[0]) { return $false }
         if ($segments.Count -ge 2 -and $segments[1] -notmatch '^[*xX]$' -and $version.Minor -ne [int]$segments[1]) { return $false }
@@ -291,15 +344,43 @@ function Test-SingleRequirement {
     return (Test-VersionAtLeast -VersionText $VersionText -Minimum $req) -and (Test-VersionLessThan -VersionText $VersionText -Maximum $upperBound)
 }
 
+function Split-VersionRequirement {
+    param([Parameter(Mandatory = $true)][string]$Requirement)
+
+    $parts = @()
+    foreach ($alternativePart in ($Requirement -split '\s*,\s*')) {
+        $trimmed = $alternativePart.Trim()
+        if (-not $trimmed) { continue }
+
+        $matches = [regex]::Matches($trimmed, '(>=|<=|>|<|=|~|\^)?\s*([0-9]+(?:\.[0-9]+)?\.[*xX]|[0-9]+\.[*xX]|[*xX]|[0-9]+(?:\.[0-9]+){0,2}(?:[-+][0-9A-Za-z.-]+)?)')
+        if ($matches.Count -eq 0) {
+            throw "Unsupported version requirement fragment '$trimmed'."
+        }
+
+        foreach ($match in $matches) {
+            $operator = $match.Groups[1].Value
+            $version = $match.Groups[2].Value
+            $parts += "$operator$version"
+        }
+    }
+
+    return $parts
+}
+
 function Test-VersionRequirement {
     param(
         [Parameter(Mandatory = $true)][string]$VersionText,
         [Parameter(Mandatory = $true)][string]$Requirement
     )
 
+    $versionParts = ConvertTo-VersionParts -VersionText $VersionText
+    if ($versionParts.PreRelease -and $Requirement -notmatch '-') {
+        return $false
+    }
+
     foreach ($alternative in ($Requirement -split '\s*\|\|\s*')) {
         $ok = $true
-        foreach ($part in ($alternative -split '\s*,\s*|\s+')) {
+        foreach ($part in (Split-VersionRequirement -Requirement $alternative)) {
             if ($part.Trim()) {
                 if (-not (Test-SingleRequirement -VersionText $VersionText -Requirement $part)) {
                     $ok = $false
@@ -327,10 +408,13 @@ function Select-CrateVersion {
         throw "No version satisfies '$Requirement'."
     }
 
-    return @($candidates | Sort-Object -Property @{ Expression = { ConvertTo-VersionParts -VersionText $_.vers | Select-Object -ExpandProperty Major } },
-        @{ Expression = { ConvertTo-VersionParts -VersionText $_.vers | Select-Object -ExpandProperty Minor } },
-        @{ Expression = { ConvertTo-VersionParts -VersionText $_.vers | Select-Object -ExpandProperty Patch } },
-        @{ Expression = { $_.vers } })[-1]
+    $selected = $candidates[0]
+    foreach ($candidate in $candidates) {
+        if ((Compare-VersionText -Left $candidate.vers -Right $selected.vers) -gt 0) {
+            $selected = $candidate
+        }
+    }
+    return $selected
 }
 
 function ConvertTo-RootRequirement {
@@ -526,6 +610,21 @@ function Test-DependencyEnabled {
     return $ActiveFeatures -and ($ActiveFeatures.Contains($depName) -or $ActiveFeatures.Contains("dep:$depName") -or $ActiveFeatures.Contains([string]$Dependency.name))
 }
 
+function Add-FeatureSet {
+    param(
+        [Parameter(Mandatory = $true)][object]$Destination,
+        [object]$Source
+    )
+
+    $changed = $false
+    foreach ($feature in @($Source)) {
+        if ($feature -and $Destination.Add([string]$feature)) {
+            $changed = $true
+        }
+    }
+    return $changed
+}
+
 function Save-Crate {
     param(
         [Parameter(Mandatory = $true)][object]$Config,
@@ -583,6 +682,7 @@ function Resolve-CrateGraph {
     )
 
     $resolved = @{}
+    $featureSets = @{}
     $failures = @()
     $downloads = @()
     $queue = [System.Collections.Generic.Queue[object]]::new()
@@ -598,26 +698,47 @@ function Resolve-CrateGraph {
             $records = Read-CrateIndex -RegistryBase $RegistryBase -Name $name
             $selected = Select-CrateVersion -Records $records -Requirement ([string]$request.Requirement)
             $key = "$($selected.name)@$($selected.vers)"
-            if ($resolved.ContainsKey($key)) {
+            $activeFeatures = Get-ActiveFeatureSet -Record $selected -RequestedFeatures @($request.Features) -UseAllFeatures:($AllFeatures -and $request.Root) -DisableDefaultFeatures:([bool]$request.NoDefaultFeatures)
+
+            $shouldProcessDependencies = $false
+            if (-not $resolved.ContainsKey($key)) {
+                $resolved[$key] = [pscustomobject]@{
+                    Name         = $selected.name
+                    Version      = $selected.vers
+                    Requirements = @([string]$request.Requirement)
+                    Parents      = @($request.Parent)
+                    Features     = @()
+                }
+                $featureSets[$key] = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                $downloads += Save-Crate -Config $Config -Record $selected -DestinationRoot $OutputDirectory
+                $shouldProcessDependencies = $true
+            }
+            else {
+                $node = $resolved[$key]
+                if ([string]$request.Requirement -notin @($node.Requirements)) {
+                    $node.Requirements = @($node.Requirements) + [string]$request.Requirement
+                }
+                if ($request.Parent -and $request.Parent -notin @($node.Parents)) {
+                    $node.Parents = @($node.Parents) + $request.Parent
+                }
+            }
+
+            if (Add-FeatureSet -Destination $featureSets[$key] -Source $activeFeatures) {
+                $shouldProcessDependencies = $true
+            }
+
+            if (-not $shouldProcessDependencies) {
                 continue
             }
 
-            $resolved[$key] = [pscustomobject]@{
-                Name        = $selected.name
-                Version     = $selected.vers
-                Requirement = $request.Requirement
-                Parent      = $request.Parent
-            }
-            $downloads += Save-Crate -Config $Config -Record $selected -DestinationRoot $OutputDirectory
-
-            $activeFeatures = Get-ActiveFeatureSet -Record $selected -RequestedFeatures @($request.Features) -UseAllFeatures:($AllFeatures -and $request.Root) -DisableDefaultFeatures:([bool]$request.NoDefaultFeatures)
+            $resolved[$key].Features = @($featureSets[$key]) | Sort-Object
 
             foreach ($dep in @($selected.deps)) {
                 $kind = if ($dep.PSObject.Properties['kind'] -and $dep.kind) { [string]$dep.kind } else { 'normal' }
                 if ($kind -eq 'dev' -and -not $IncludeDevDependencies) { continue }
                 if ($kind -eq 'build' -and $ExcludeBuildDependencies) { continue }
                 if ($SkipTargetSpecificDependencies -and $dep.PSObject.Properties['target'] -and $dep.target) { continue }
-                if (-not (Test-DependencyEnabled -Dependency $dep -ActiveFeatures $activeFeatures)) { continue }
+                if (-not (Test-DependencyEnabled -Dependency $dep -ActiveFeatures $featureSets[$key])) { continue }
 
                 $depName = [string]$dep.name
                 if ($dep.PSObject.Properties['package'] -and $dep.package) {

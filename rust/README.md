@@ -108,7 +108,8 @@ crate-cache/
 
 The command prints a JSON summary with:
 
-- `Crates`: resolved crate names, versions, requirements, and parent edges.
+- `Crates`: resolved crate names, versions, contributing requirements, parent
+  edges, and activated feature names.
 - `Downloads`: `.crate` paths, saved index metadata paths, and download URLs.
 - `Failures`: dependency resolution or download failures.
 - `Output`: cache root.
@@ -162,6 +163,10 @@ index, which is what Cargo uses for published registry packages. It chooses the
 highest non-yanked matching version by default. Use `-IncludeYanked` to allow
 yanked versions when a graph explicitly needs them.
 
+Prerelease versions are only eligible when the requirement explicitly includes a
+prerelease marker. This matches Cargo's practical behavior and prevents broad
+stable ranges such as `^1.6.1` from selecting `2.0.0-alpha` releases.
+
 For `-ManifestPath`, the script reads straightforward registry dependency
 entries from `[dependencies]`, `[build-dependencies]`, and
 `[dev-dependencies]`. It supports string requirements and common inline tables
@@ -179,9 +184,10 @@ The resolver includes:
 Feature handling is intentionally pragmatic. The script activates the root
 default feature unless `-NoDefaultFeatures` is provided, activates any root
 features passed with `-Features`, and can activate every root feature with
-`-AllFeatures`. Dependency feature lists are carried to the dependency node.
-This approximates the retrieval behavior needed to collect source archives, but
-it is not Cargo's full feature resolver.
+`-AllFeatures`. Dependency feature lists are carried to the dependency node, and
+feature requests are unified when the same crate/version is reached through
+multiple edges. This approximates the retrieval behavior needed to collect
+source archives, but it is not Cargo's full feature resolver.
 
 ## Important Differences From Cargo
 
