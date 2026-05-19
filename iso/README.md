@@ -73,15 +73,6 @@ script can read, the error explains that the media may be truncated, sparse,
 corrupt, or intentionally malformed, and recommends reacquiring the ISO and
 checking the whole-file hash against the source.
 
-## Validation
-
-The scanner was validated against Debian 13.5.0 amd64 netinst from Debian's
-official download site. The script generated a compact per-file manifest for
-1,011 ISO-visible files.
-
-It was also smoke-tested against a RHEL-family public Rocky Linux boot ISO and a
-synthetic ISO record with a file size above `Int32.MaxValue`.
-
 ## Limitations
 
 - The script hashes ISO-visible files, not every file inside nested payloads.

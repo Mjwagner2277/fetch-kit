@@ -10,8 +10,7 @@ container CLIs.
 ## Contents
 
 - `go/` - Go module and dependency retrieval without invoking the Go toolchain.
-- `iso/` - ISO-9660/Joliet file listing, Linux installer summary, and per-file
-  checksum manifests without mounting the ISO.
+- `iso/` - ISO-9660/Joliet short-hash file manifests without mounting the ISO.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
