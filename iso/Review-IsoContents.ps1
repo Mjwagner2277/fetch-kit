@@ -28,6 +28,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# ISO-9660 uses fixed 2048-byte sectors. File records point to sectors, so
+# reading a file later means seeking to Extent * 2048 and streaming Size bytes.
 $SectorSize = 2048
 
 function Read-Bytes {
@@ -37,6 +39,8 @@ function Read-Bytes {
         [Parameter(Mandatory)][int]$Count
     )
 
+    # All reads are explicit range reads against the ISO stream. This keeps the
+    # script mount-free and avoids extracting the full image.
     $buffer = [byte[]]::new($Count)
     $null = $Stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
     $read = $Stream.Read($buffer, 0, $Count)
@@ -87,6 +91,7 @@ function Convert-IsoName {
         [bool]$Joliet
     )
 
+    # Directory records use raw 0 and 1 names for "." and "..".
     if ($Length -eq 1 -and $Bytes[$Offset] -eq 0) { return '.' }
     if ($Length -eq 1 -and $Bytes[$Offset] -eq 1) { return '..' }
 
@@ -145,6 +150,8 @@ function Read-DirectoryRecord {
         [bool]$Joliet
     )
 
+    # A directory record describes one visible file or directory: name, starting
+    # sector, byte size, flags, and timestamp.
     $length = $Sector[$Offset]
     if ($length -eq 0) { return $null }
     if (($Offset + $length) -gt $Sector.Length -or $length -lt 34) { return $null }
@@ -170,6 +177,8 @@ function Read-DirectoryRecord {
 function Read-VolumeDescriptors {
     param([System.IO.FileStream]$Stream)
 
+    # Volume descriptors begin at sector 16. Prefer a Joliet supplementary
+    # descriptor when one exists because it preserves long Unicode names better.
     $descriptors = @()
     for ($sector = 16; $sector -lt 512; $sector++) {
         $bytes = Read-Bytes -Stream $Stream -Offset ([Int64]$sector * $SectorSize) -Count $SectorSize
@@ -214,6 +223,8 @@ function Get-IsoEntries {
         [bool]$Joliet
     )
 
+    # Walk directories breadth-first. Each directory is itself a byte range in
+    # the ISO containing more directory records.
     $queue = [System.Collections.Queue]::new()
     $queue.Enqueue([pscustomobject]@{ Path = '\'; Record = $RootRecord })
     $entries = [System.Collections.Generic.List[object]]::new()
@@ -264,86 +275,6 @@ function Get-IsoEntries {
     return $entries
 }
 
-function Test-ProbablyText {
-    param([byte[]]$Bytes)
-
-    if ($Bytes.Length -eq 0) { return $false }
-    $sampleLength = [Math]::Min($Bytes.Length, 512)
-    $printable = 0
-    $control = 0
-
-    for ($i = 0; $i -lt $sampleLength; $i++) {
-        $b = $Bytes[$i]
-        if ($b -eq 9 -or $b -eq 10 -or $b -eq 13 -or ($b -ge 32 -and $b -le 126)) {
-            $printable++
-        }
-        elseif ($b -lt 32 -or $b -eq 127) {
-            $control++
-        }
-    }
-
-    return (($printable / $sampleLength) -ge 0.85 -and $control -le 8)
-}
-
-function Get-TextPreview {
-    param(
-        [System.IO.FileStream]$Stream,
-        [pscustomobject]$Entry,
-        [int]$MaxBytes
-    )
-
-    $readLength = [Math]::Min([int64]$MaxBytes, [int64]$Entry.Size)
-    if ($readLength -le 0) { return $null }
-
-    $bytes = Read-Bytes -Stream $Stream -Offset ([Int64]$Entry.Extent * $SectorSize) -Count ([int]$readLength)
-    if (-not (Test-ProbablyText -Bytes $bytes)) { return $null }
-
-    return ([Text.Encoding]::UTF8.GetString($bytes) -replace "`0", '' -replace '\p{C}&&[^\r\n\t]', '').Trim()
-}
-
-function Export-IsoEntry {
-    param(
-        [System.IO.FileStream]$Stream,
-        [pscustomobject]$Entry,
-        [string]$DestinationRoot
-    )
-
-    $targetRoot = Resolve-Path -LiteralPath $DestinationRoot -ErrorAction SilentlyContinue
-    if ($null -eq $targetRoot) {
-        $null = New-Item -ItemType Directory -Path $DestinationRoot -Force
-        $targetRoot = Resolve-Path -LiteralPath $DestinationRoot
-    }
-
-    $safeRelative = $Entry.Path.TrimStart('\') -replace '[\\/:*?"<>|]', '_'
-    $target = Join-Path -Path $targetRoot.Path -ChildPath $safeRelative
-    $parent = Split-Path -Path $target -Parent
-    if (-not (Test-Path -LiteralPath $parent)) {
-        $null = New-Item -ItemType Directory -Path $parent -Force
-    }
-
-    $out = [System.IO.File]::Open($target, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    try {
-        $remaining = [Int64]$Entry.Size
-        $position = [Int64]$Entry.Extent * $SectorSize
-        $bufferSize = [Int64]1MB
-        while ($remaining -gt 0) {
-            $chunkSize = [int][Math]::Min([Int64]$bufferSize, [Int64]$remaining)
-            $chunk = Read-Bytes -Stream $Stream -Offset $position -Count $chunkSize
-            if ($chunk.Length -eq 0) {
-                throw "Unexpected end of ISO while extracting $($Entry.Path). Expected $($Entry.Size) bytes."
-            }
-            $out.Write($chunk, 0, $chunk.Length)
-            $position += $chunk.Length
-            $remaining -= $chunk.Length
-        }
-    }
-    finally {
-        $out.Dispose()
-    }
-
-    return $target
-}
-
 function New-ChecksumAlgorithm {
     param(
         [ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')]
@@ -373,6 +304,8 @@ function Get-IsoEntryChecksum {
         [string]$Algorithm
     )
 
+    # Stream the file's byte range into the hash algorithm. This hashes the
+    # visible ISO file without creating an extracted copy on disk.
     $hash = New-ChecksumAlgorithm -Algorithm $Algorithm
     try {
         $remaining = [Int64]$Entry.Size
@@ -406,6 +339,8 @@ function Get-IsoFileManifest {
         [object[]]$Entries
     )
 
+    # Manifest output is intentionally minimal: the visible path, file size,
+    # modified time, and a short SHA256 value for quick comparison.
     $files = @($Entries | Where-Object { -not $_.IsDirectory } | Sort-Object Path)
 
     $index = 0
@@ -428,6 +363,7 @@ function Get-IsoFileManifest {
 function Resolve-OutputPath {
     param([string]$OutputPath)
 
+    # Accept relative output paths and create parent directories as needed.
     $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
     $parent = Split-Path -Path $resolved -Parent
     if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
@@ -442,6 +378,8 @@ function Export-TextManifest {
         [string]$OutputPath
     )
 
+    # Text output is tab-delimited so it stays simple to parse in PowerShell or
+    # spreadsheet tools while preserving paths with spaces.
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add("Path`tSize`tModified`tShortSha256")
     foreach ($row in $Manifest) {
@@ -451,235 +389,16 @@ function Export-TextManifest {
     [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
 }
 
-function Find-IsoEntry {
-    param(
-        [object[]]$Entries,
-        [string[]]$Patterns
-    )
-
-    foreach ($pattern in $Patterns) {
-        $match = $Entries | Where-Object { $_.Path -like $pattern } | Select-Object -First 1
-        if ($null -ne $match) { return $match }
-    }
-
-    return $null
-}
-
-function Get-RhelIsoSummary {
-    param(
-        [System.IO.FileStream]$Stream,
-        [object[]]$Entries
-    )
-
-    $treeInfo = Find-IsoEntry -Entries $Entries -Patterns @('\.treeinfo')
-    $mediaRepo = Find-IsoEntry -Entries $Entries -Patterns @('\media.repo')
-    $installImage = Find-IsoEntry -Entries $Entries -Patterns @('\images\install.img')
-    $kernel = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\vmlinuz', '\images\pxeboot\vmlinuz')
-    $initrd = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\initrd.img', '\images\pxeboot\initrd.img')
-    $biosLoader = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\isolinux.bin')
-    $uefiLoader = Find-IsoEntry -Entries $Entries -Patterns @('\EFI\BOOT\BOOTX64.EFI', '\EFI\BOOT\BOOTAA64.EFI')
-    $baseOs = Find-IsoEntry -Entries $Entries -Patterns @('\BaseOS', '\BaseOS\Packages')
-    $appStream = Find-IsoEntry -Entries $Entries -Patterns @('\AppStream', '\AppStream\Packages')
-    $rpmCount = @($Entries | Where-Object { -not $_.IsDirectory -and $_.Path -like '*.rpm' }).Count
-
-    $treeInfoPreview = $null
-    if ($null -ne $treeInfo) {
-        $treeInfoPreview = Get-TextPreview -Stream $Stream -Entry $treeInfo -MaxBytes 8192
-    }
-
-    [pscustomobject]@{
-        LooksLikeRhelFamilyInstaller = [bool]($treeInfo -or $installImage -or ($kernel -and $initrd))
-        TreeInfo                     = if ($treeInfo) { $treeInfo.Path } else { $null }
-        MediaRepo                    = if ($mediaRepo) { $mediaRepo.Path } else { $null }
-        InstallImage                 = if ($installImage) { $installImage.Path } else { $null }
-        Kernel                       = if ($kernel) { $kernel.Path } else { $null }
-        Initrd                       = if ($initrd) { $initrd.Path } else { $null }
-        BiosBootloader               = if ($biosLoader) { $biosLoader.Path } else { $null }
-        UefiBootloader               = if ($uefiLoader) { $uefiLoader.Path } else { $null }
-        BaseOSRepoPresent            = [bool]$baseOs
-        AppStreamRepoPresent         = [bool]$appStream
-        RpmFileCount                 = $rpmCount
-        TreeInfoPreview              = $treeInfoPreview
-    }
-}
-
-function Get-LinuxIsoSummary {
-    param(
-        [System.IO.FileStream]$Stream,
-        [object[]]$Entries
-    )
-
-    $debianInfo = Find-IsoEntry -Entries $Entries -Patterns @('\.disk\info')
-    $debianDists = Find-IsoEntry -Entries $Entries -Patterns @('\dists\*')
-    $debianPool = Find-IsoEntry -Entries $Entries -Patterns @('\pool\*')
-    $debianKernel = Find-IsoEntry -Entries $Entries -Patterns @('\install.*\vmlinuz', '\install.*\gtk\vmlinuz')
-    $debianInitrd = Find-IsoEntry -Entries $Entries -Patterns @('\install.*\initrd.gz', '\install.*\gtk\initrd.gz')
-
-    $rhelTreeInfo = Find-IsoEntry -Entries $Entries -Patterns @('\.treeinfo')
-    $rhelInstallImage = Find-IsoEntry -Entries $Entries -Patterns @('\images\install.img')
-    $rhelKernel = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\vmlinuz', '\images\pxeboot\vmlinuz')
-    $rhelInitrd = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\initrd.img', '\images\pxeboot\initrd.img')
-
-    $isolinux = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\isolinux.bin')
-    $syslinuxCfg = Find-IsoEntry -Entries $Entries -Patterns @('\isolinux\isolinux.cfg', '\isolinux\txt.cfg')
-    $grubCfg = Find-IsoEntry -Entries $Entries -Patterns @('\boot\grub\grub.cfg', '\EFI\BOOT\grub.cfg', '\EFI\debian\grub.cfg')
-    $uefiLoader = Find-IsoEntry -Entries $Entries -Patterns @('\EFI\BOOT\BOOTX64.EFI', '\EFI\boot\bootx64.efi', '\EFI\BOOT\BOOTAA64.EFI', '\EFI\boot\bootaa64.efi')
-
-    $packageCount = @($Entries | Where-Object { -not $_.IsDirectory -and ($_.Path -like '*.deb' -or $_.Path -like '*.udeb' -or $_.Path -like '*.rpm') }).Count
-    $checksumManifests = @($Entries | Where-Object { -not $_.IsDirectory -and ($_.Path -like '*SHA*SUM*' -or $_.Path -like '*MD5SUM*' -or $_.Path -like '\md5sum.txt') } | Select-Object -ExpandProperty Path)
-
-    $infoPreview = $null
-    if ($null -ne $debianInfo) {
-        $infoPreview = Get-TextPreview -Stream $Stream -Entry $debianInfo -MaxBytes 2048
-    }
-    elseif ($null -ne $rhelTreeInfo) {
-        $infoPreview = Get-TextPreview -Stream $Stream -Entry $rhelTreeInfo -MaxBytes 4096
-    }
-
-    [pscustomobject]@{
-        LooksLikeLinuxInstaller = [bool]($debianInfo -or $debianDists -or $rhelTreeInfo -or $rhelInstallImage -or ($uefiLoader -and ($debianKernel -or $rhelKernel)))
-        LikelyFamily            = if ($debianInfo -or $debianDists) { 'Debian-family' } elseif ($rhelTreeInfo -or $rhelInstallImage) { 'RHEL-family' } else { 'Unknown Linux installer' }
-        InstallerInfo           = if ($debianInfo) { $debianInfo.Path } elseif ($rhelTreeInfo) { $rhelTreeInfo.Path } else { $null }
-        InstallerInfoPreview    = $infoPreview
-        Kernel                  = if ($debianKernel) { $debianKernel.Path } elseif ($rhelKernel) { $rhelKernel.Path } else { $null }
-        Initrd                  = if ($debianInitrd) { $debianInitrd.Path } elseif ($rhelInitrd) { $rhelInitrd.Path } else { $null }
-        BiosBootloader          = if ($isolinux) { $isolinux.Path } else { $null }
-        UefiBootloader          = if ($uefiLoader) { $uefiLoader.Path } else { $null }
-        GrubConfig              = if ($grubCfg) { $grubCfg.Path } else { $null }
-        SyslinuxConfig          = if ($syslinuxCfg) { $syslinuxCfg.Path } else { $null }
-        DebianDistsPresent      = [bool]$debianDists
-        DebianPoolPresent       = [bool]$debianPool
-        PackageFileCount        = $packageCount
-        ChecksumManifests       = $checksumManifests
-    }
-}
-
-function Get-Entropy {
-    param([byte[]]$Bytes)
-
-    if ($Bytes.Length -eq 0) { return 0 }
-    $counts = [int[]]::new(256)
-    foreach ($byte in $Bytes) { $counts[$byte]++ }
-
-    $entropy = 0.0
-    foreach ($count in $counts) {
-        if ($count -gt 0) {
-            $p = $count / $Bytes.Length
-            $entropy -= $p * [Math]::Log($p, 2)
-        }
-    }
-    return [Math]::Round($entropy, 3)
-}
-
-function Get-PrintableStrings {
-    param(
-        [System.IO.FileStream]$Stream,
-        [int]$Limit
-    )
-
-    $interesting = [regex]'(?i)(powershell|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|schtasks|autorun\.inf|setup\.exe|\.ps1|\.vbs|\.js|\.hta|password|credential|token|http://|https://|[a-z0-9.-]+\.(exe|dll|sys|scr|bat|cmd))'
-    $results = [System.Collections.Generic.List[string]]::new()
-    $buffer = [byte[]]::new(1MB)
-    $carry = ''
-    $null = $Stream.Seek(0, [System.IO.SeekOrigin]::Begin)
-
-    while (($read = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0 -and $results.Count -lt $Limit) {
-        $chunkBytes = if ($read -eq $buffer.Length) { $buffer } else { $buffer[0..($read - 1)] }
-        $text = $carry + ([Text.Encoding]::ASCII.GetString($chunkBytes) -replace '[^\x20-\x7e]', "`n")
-        $parts = $text -split "`n"
-        $carry = $parts[-1]
-        foreach ($part in $parts[0..([Math]::Max(0, $parts.Count - 2))]) {
-            if ($part.Length -ge 5 -and $interesting.IsMatch($part)) {
-                $results.Add($part.Trim())
-                if ($results.Count -ge $Limit) { break }
-            }
-        }
-    }
-
-    return $results
-}
-
-function Get-SignatureHits {
-    param([System.IO.FileStream]$Stream)
-
-    $signatures = @(
-        @{ Name = 'MZ executable'; Bytes = [byte[]](0x4D, 0x5A) },
-        @{ Name = 'ZIP/JAR/DOCX/APK'; Bytes = [byte[]](0x50, 0x4B, 0x03, 0x04) },
-        @{ Name = 'RAR archive'; Bytes = [byte[]](0x52, 0x61, 0x72, 0x21) },
-        @{ Name = '7z archive'; Bytes = [byte[]](0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C) },
-        @{ Name = 'ELF binary'; Bytes = [byte[]](0x7F, 0x45, 0x4C, 0x46) },
-        @{ Name = 'PDF'; Bytes = [byte[]](0x25, 0x50, 0x44, 0x46) }
-    )
-
-    $hits = [System.Collections.Generic.List[object]]::new()
-    $buffer = [byte[]]::new(1MB)
-    $overlap = [byte[]]::new(16)
-    $absolute = [Int64]0
-    $null = $Stream.Seek(0, [System.IO.SeekOrigin]::Begin)
-
-    while (($read = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-        $combined = [byte[]]::new($overlap.Length + $read)
-        [Array]::Copy($overlap, 0, $combined, 0, $overlap.Length)
-        [Array]::Copy($buffer, 0, $combined, $overlap.Length, $read)
-
-        foreach ($sig in $signatures) {
-            $needle = [byte[]]$sig.Bytes
-            for ($i = 0; $i -le ($combined.Length - $needle.Length); $i++) {
-                $matched = $true
-                for ($j = 0; $j -lt $needle.Length; $j++) {
-                    if ($combined[$i + $j] -ne $needle[$j]) {
-                        $matched = $false
-                        break
-                    }
-                }
-                if ($matched) {
-                    $offset = $absolute + $i - $overlap.Length
-                    if ($offset -ge 0) {
-                        $hits.Add([pscustomobject]@{ Signature = $sig.Name; Offset = $offset })
-                    }
-                    if ($hits.Count -ge 200) { return $hits }
-                }
-            }
-        }
-
-        $copy = [Math]::Min($overlap.Length, $read)
-        [Array]::Copy($buffer, $read - $copy, $overlap, $overlap.Length - $copy, $copy)
-        $absolute += $read
-    }
-
-    return $hits
-}
-
-function Invoke-IsoTriage {
-    param(
-        [string]$LiteralPath,
-        [System.IO.FileStream]$Stream,
-        [object[]]$Descriptors,
-        [int]$StringLimit
-    )
-
-    $fileInfo = Get-Item -LiteralPath $LiteralPath
-    $sampleLength = [int][Math]::Min($fileInfo.Length, 4MB)
-    $sample = Read-Bytes -Stream $Stream -Offset 0 -Count $sampleLength
-
-    [pscustomobject]@{
-        Path                 = $fileInfo.FullName
-        SizeBytes            = $fileInfo.Length
-        SHA256               = (Get-FileHash -LiteralPath $fileInfo.FullName -Algorithm SHA256).Hash
-        SHA1                 = (Get-FileHash -LiteralPath $fileInfo.FullName -Algorithm SHA1).Hash
-        MD5                  = (Get-FileHash -LiteralPath $fileInfo.FullName -Algorithm MD5).Hash
-        SampleEntropy        = Get-Entropy -Bytes $sample
-        VolumeDescriptors    = $Descriptors | Select-Object Sector, TypeName, IsJoliet, VolumeIdentifier, SystemIdentifier, VolumeSpaceSectors
-        SignatureHits        = Get-SignatureHits -Stream $Stream | Select-Object -First 50
-        InterestingStrings   = Get-PrintableStrings -Stream $Stream -Limit $StringLimit
-        RecommendedNextStep  = 'If file-level inspection fails, treat this as opaque media: preserve the ISO, hash it, scan it with AV/YARA in an isolated analysis VM, compare hashes against known-good/vendor sources, inspect boot records and embedded executable signatures, and only then detonate/extract with a dedicated forensic ISO/UDF parser or sandbox.'
-    }
-}
-
 $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
 $stream = [System.IO.File]::Open($resolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
 
 try {
+    # Main execution flow:
+    # 1. Require at least one output file target.
+    # 2. Read ISO volume descriptors and choose Joliet when available.
+    # 3. Traverse the selected root directory into file entries.
+    # 4. Stream-hash each visible file and shorten SHA256 to 12 characters.
+    # 5. Write text and/or CSV output, then print a small run summary.
     if ([string]::IsNullOrWhiteSpace($TextOutput) -and [string]::IsNullOrWhiteSpace($CsvOutput)) {
         throw 'Specify -TextOutput or -CsvOutput.'
     }
@@ -691,6 +410,8 @@ try {
     }
 
     if ($null -eq $descriptor) {
+        # At this point the script cannot see individual files. Preserve the ISO
+        # as evidence and move to a parser that supports the image's filesystem.
         throw 'No readable ISO-9660/Joliet root directory was found. File contents cannot be listed with this PowerShell-only parser. Next cyber-relevant step: preserve and hash the ISO as an artifact, verify against vendor checksums/signatures, then inspect with a forensic ISO/UDF parser or isolated sandbox.'
     }
 
