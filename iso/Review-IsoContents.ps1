@@ -201,8 +201,8 @@ function Read-DirectoryRecord {
     [pscustomobject]@{
         Length      = $length
         Name        = $name
-        Extent      = [UInt32]$extent
-        Size        = [UInt32]$size
+        Extent      = [Int64]$extent
+        Size        = [Int64]$size
         IsDirectory = (($flags -band 0x02) -ne 0)
         Timestamp   = Convert-IsoDate -Bytes $Sector -Offset ($Offset + 18)
     }
@@ -285,8 +285,8 @@ function Get-IsoEntries {
                 $entry = [pscustomobject]@{
                     Path        = $childPath
                     Name        = $record.Name
-                    Size        = [UInt32]$record.Size
-                    Extent      = [UInt32]$record.Extent
+                    Size        = [Int64]$record.Size
+                    Extent      = [Int64]$record.Extent
                     Type        = if ($record.IsDirectory) { 'Directory' } else { 'File' }
                     Modified    = $record.Timestamp
                     IsDirectory = $record.IsDirectory
@@ -366,11 +366,13 @@ function Export-IsoEntry {
     try {
         $remaining = [Int64]$Entry.Size
         $position = [Int64]$Entry.Extent * $SectorSize
-        $bufferSize = 1MB
+        $bufferSize = [Int64]1MB
         while ($remaining -gt 0) {
-            $chunkSize = [int][Math]::Min($bufferSize, $remaining)
+            $chunkSize = [int][Math]::Min([Int64]$bufferSize, [Int64]$remaining)
             $chunk = Read-Bytes -Stream $Stream -Offset $position -Count $chunkSize
-            if ($chunk.Length -eq 0) { break }
+            if ($chunk.Length -eq 0) {
+                throw "Unexpected end of ISO while extracting $($Entry.Path). Expected $($Entry.Size) bytes."
+            }
             $out.Write($chunk, 0, $chunk.Length)
             $position += $chunk.Length
             $remaining -= $chunk.Length
@@ -416,12 +418,14 @@ function Get-IsoEntryChecksum {
     try {
         $remaining = [Int64]$Entry.Size
         $position = [Int64]$Entry.Extent * $SectorSize
-        $bufferSize = 1MB
+        $bufferSize = [Int64]1MB
 
         while ($remaining -gt 0) {
-            $chunkSize = [int][Math]::Min($bufferSize, $remaining)
+            $chunkSize = [int][Math]::Min([Int64]$bufferSize, [Int64]$remaining)
             $chunk = Read-Bytes -Stream $Stream -Offset $position -Count $chunkSize
-            if ($chunk.Length -eq 0) { break }
+            if ($chunk.Length -eq 0) {
+                throw "Unexpected end of ISO while hashing $($Entry.Path). Expected $($Entry.Size) bytes."
+            }
 
             $null = $hash.TransformBlock($chunk, 0, $chunk.Length, $null, 0)
             $position += $chunk.Length
