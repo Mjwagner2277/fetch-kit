@@ -44,14 +44,13 @@ Common use:
 ```powershell
 .\iso\Review-IsoContents.ps1 `
   -Path .\debian-13.5.0-amd64-netinst.iso `
-  -LinuxSummary `
-  -FileChecksums `
-  -ChecksumCsv .\debian-13.5.0-amd64-netinst-file-manifest.csv
+  -CsvOutput .\debian-13.5.0-amd64-netinst-file-manifest.csv
 ```
 
-The checksum manifest lists each ISO-visible file with its path, size, modified
-time, checksum algorithm, and checksum. This is useful for cyber review,
-air-gap intake, provenance notes, and comparing installer media across sources.
+The manifest lists each ISO-visible file with its path, size, modified time, and
+12-character `ShortSha256` value. This is useful for cyber review, air-gap
+intake, provenance notes, and quick comparison of installer media across
+sources.
 
 ## Podman Pull Replacement
 

@@ -4,66 +4,25 @@ Reviews the contents of an ISO file without mounting it.
 
 .DESCRIPTION
 Parses ISO-9660 and Joliet directory records directly from the ISO bytes using
-PowerShell only. When the image cannot be inspected as ISO-9660/Joliet, the
-script performs cyber-relevant triage: hashes, volume descriptor summary,
-boot catalog hints, file-signature scan, printable strings, and entropy.
+PowerShell only, then writes a compact per-file SHA256 manifest using 12-character
+short hashes.
 
 .EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso
+.\Review-IsoContents.ps1 -Path .\sample.iso -CsvOutput .\sample-iso-manifest.csv
 
 .EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -PreviewText -MaxPreviewBytes 4096
-
-.EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -LinuxSummary -FileChecksums -ChecksumCsv .\iso-manifest.csv
-
-.EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -FileChecksums | Format-Table Path, Size, Algorithm, Checksum -AutoSize
-
-.EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -ExtractPath '\README.TXT' -Destination .\out
+.\Review-IsoContents.ps1 -Path .\sample.iso -TextOutput .\sample-iso-manifest.txt
 #>
 
-[CmdletBinding(DefaultParameterSetName = 'List')]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)]
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
     [string]$Path,
 
-    [Parameter(ParameterSetName = 'List')]
-    [switch]$PreviewText,
+    [string]$TextOutput,
 
-    [Parameter(ParameterSetName = 'List')]
-    [int]$MaxPreviewBytes = 2048,
-
-    [Parameter(ParameterSetName = 'List')]
-    [switch]$RhelSummary,
-
-    [Parameter(ParameterSetName = 'List')]
-    [switch]$LinuxSummary,
-
-    [Parameter(ParameterSetName = 'List')]
-    [int]$MaxEntries = 0,
-
-    [Parameter(ParameterSetName = 'List')]
-    [switch]$FileChecksums,
-
-    [Parameter(ParameterSetName = 'List')]
-    [ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')]
-    [string]$ChecksumAlgorithm = 'SHA256',
-
-    [Parameter(ParameterSetName = 'List')]
-    [string]$ChecksumCsv,
-
-    [Parameter(ParameterSetName = 'Extract')]
-    [string]$ExtractPath,
-
-    [Parameter(ParameterSetName = 'Extract')]
-    [string]$Destination = '.',
-
-    [switch]$IncludeTriage,
-
-    [int]$MaxStrings = 80
+    [string]$CsvOutput
 )
 
 Set-StrictMode -Version Latest
@@ -444,32 +403,52 @@ function Get-IsoEntryChecksum {
 function Get-IsoFileManifest {
     param(
         [System.IO.FileStream]$Stream,
-        [object[]]$Entries,
-        [ValidateSet('MD5', 'SHA1', 'SHA256', 'SHA384', 'SHA512')]
-        [string]$Algorithm,
-        [int]$Limit = 0
+        [object[]]$Entries
     )
 
     $files = @($Entries | Where-Object { -not $_.IsDirectory } | Sort-Object Path)
-    if ($Limit -gt 0) {
-        $files = @($files | Select-Object -First $Limit)
-    }
 
     $index = 0
     foreach ($entry in $files) {
         $index++
-        Write-Progress -Activity "Hashing ISO files with $Algorithm" -Status $entry.Path -PercentComplete (($index / [Math]::Max($files.Count, 1)) * 100)
+        Write-Progress -Activity 'Hashing ISO files with SHA256' -Status $entry.Path -PercentComplete (($index / [Math]::Max($files.Count, 1)) * 100)
+        $sha256 = Get-IsoEntryChecksum -Stream $Stream -Entry $entry -Algorithm SHA256
 
         [pscustomobject]@{
-            Path      = $entry.Path
-            Size      = $entry.Size
-            Modified  = $entry.Modified
-            Algorithm = $Algorithm
-            Checksum  = Get-IsoEntryChecksum -Stream $Stream -Entry $entry -Algorithm $Algorithm
+            Path        = $entry.Path
+            Size        = $entry.Size
+            Modified    = $entry.Modified
+            ShortSha256 = $sha256.Substring(0, 12)
         }
     }
 
-    Write-Progress -Activity "Hashing ISO files with $Algorithm" -Completed
+    Write-Progress -Activity 'Hashing ISO files with SHA256' -Completed
+}
+
+function Resolve-OutputPath {
+    param([string]$OutputPath)
+
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+    $parent = Split-Path -Path $resolved -Parent
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+        $null = New-Item -ItemType Directory -Path $parent -Force
+    }
+    return $resolved
+}
+
+function Export-TextManifest {
+    param(
+        [object[]]$Manifest,
+        [string]$OutputPath
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("Path`tSize`tModified`tShortSha256")
+    foreach ($row in $Manifest) {
+        $modified = if ($null -ne $row.Modified) { $row.Modified.ToString('s') } else { '' }
+        $lines.Add("$($row.Path)`t$($row.Size)`t$modified`t$($row.ShortSha256)")
+    }
+    [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
 }
 
 function Find-IsoEntry {
@@ -701,6 +680,10 @@ $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
 $stream = [System.IO.File]::Open($resolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
 
 try {
+    if ([string]::IsNullOrWhiteSpace($TextOutput) -and [string]::IsNullOrWhiteSpace($CsvOutput)) {
+        throw 'Specify -TextOutput or -CsvOutput.'
+    }
+
     $descriptors = @(Read-VolumeDescriptors -Stream $stream)
     $descriptor = $descriptors | Where-Object { $_.IsJoliet -and $_.RootRecord } | Select-Object -First 1
     if ($null -eq $descriptor) {
@@ -708,94 +691,27 @@ try {
     }
 
     if ($null -eq $descriptor) {
-        Write-Warning 'No readable ISO-9660/Joliet root directory was found. File contents cannot be listed with PowerShell-only parsing in this script.'
-        Invoke-IsoTriage -LiteralPath $resolvedPath -Stream $stream -Descriptors $descriptors -StringLimit $MaxStrings
-        return
+        throw 'No readable ISO-9660/Joliet root directory was found. File contents cannot be listed with this PowerShell-only parser. Next cyber-relevant step: preserve and hash the ISO as an artifact, verify against vendor checksums/signatures, then inspect with a forensic ISO/UDF parser or isolated sandbox.'
     }
 
     $entries = @(Get-IsoEntries -Stream $stream -RootRecord $descriptor.RootRecord -Joliet:$descriptor.IsJoliet)
+    $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries)
 
-    if ($PSCmdlet.ParameterSetName -eq 'Extract') {
-        $normalized = if ($ExtractPath.StartsWith('\')) { $ExtractPath } else { '\' + $ExtractPath }
-        $entry = $entries | Where-Object { -not $_.IsDirectory -and $_.Path -ieq $normalized } | Select-Object -First 1
-        if ($null -eq $entry) {
-            throw "File not found in ISO: $ExtractPath"
-        }
-
-        $target = Export-IsoEntry -Stream $stream -Entry $entry -DestinationRoot $Destination
-        [pscustomobject]@{
-            ExtractedPath = $entry.Path
-            Size          = $entry.Size
-            Destination   = $target
-        }
-        return
+    if (-not [string]::IsNullOrWhiteSpace($CsvOutput)) {
+        $manifest | Export-Csv -LiteralPath (Resolve-OutputPath -OutputPath $CsvOutput) -NoTypeInformation
     }
 
-    $isoSummary = [pscustomobject]@{
+    if (-not [string]::IsNullOrWhiteSpace($TextOutput)) {
+        Export-TextManifest -Manifest $manifest -OutputPath $TextOutput
+    }
+
+    [pscustomobject]@{
         IsoPath           = $resolvedPath
         Filesystem        = if ($descriptor.IsJoliet) { 'Joliet / ISO-9660' } else { 'ISO-9660' }
         VolumeIdentifier = $descriptor.VolumeIdentifier
-        FileCount         = @($entries | Where-Object { -not $_.IsDirectory }).Count
-        DirectoryCount    = @($entries | Where-Object { $_.IsDirectory }).Count
-    }
-
-    if (-not $FileChecksums -and [string]::IsNullOrWhiteSpace($ChecksumCsv)) {
-        $isoSummary
-    }
-
-    if ($RhelSummary) {
-        Get-RhelIsoSummary -Stream $stream -Entries $entries
-    }
-
-    if ($LinuxSummary) {
-        Get-LinuxIsoSummary -Stream $stream -Entries $entries
-    }
-
-    if ($FileChecksums -or -not [string]::IsNullOrWhiteSpace($ChecksumCsv)) {
-        $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries -Algorithm $ChecksumAlgorithm -Limit $MaxEntries)
-
-        if (-not [string]::IsNullOrWhiteSpace($ChecksumCsv)) {
-            $csvPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ChecksumCsv)
-            $csvParent = Split-Path -Path $csvPath -Parent
-            if (-not [string]::IsNullOrWhiteSpace($csvParent) -and -not (Test-Path -LiteralPath $csvParent)) {
-                $null = New-Item -ItemType Directory -Path $csvParent -Force
-            }
-            $manifest | Export-Csv -LiteralPath $csvPath -NoTypeInformation
-
-            Write-Verbose "Wrote $($manifest.Count) $ChecksumAlgorithm file checksum rows to $csvPath"
-        }
-
-        $manifest
-    }
-    else {
-        $displayEntries = $entries | Sort-Object Path
-        if ($MaxEntries -gt 0) {
-            $displayEntries = $displayEntries | Select-Object -First $MaxEntries
-        }
-
-        $displayEntries |
-            Select-Object Type, Size, Modified, Path
-    }
-
-    if ($PreviewText) {
-        $textExtensions = '.txt', '.inf', '.ini', '.cfg', '.xml', '.json', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.hta', '.html', '.htm', '.log', '.nfo', '.md'
-        $previewEntries = $entries | Where-Object {
-            -not $_.IsDirectory -and $textExtensions -contains ([IO.Path]::GetExtension($_.Path).ToLowerInvariant())
-        } | Select-Object -First 25
-
-        foreach ($entry in $previewEntries) {
-            $preview = Get-TextPreview -Stream $stream -Entry $entry -MaxBytes $MaxPreviewBytes
-            if ($null -ne $preview -and $preview.Length -gt 0) {
-                [pscustomobject]@{
-                    PreviewPath = $entry.Path
-                    Preview    = $preview
-                }
-            }
-        }
-    }
-
-    if ($IncludeTriage) {
-        Invoke-IsoTriage -LiteralPath $resolvedPath -Stream $stream -Descriptors $descriptors -StringLimit $MaxStrings
+        FileCount         = $manifest.Count
+        TextOutput        = if ([string]::IsNullOrWhiteSpace($TextOutput)) { $null } else { Resolve-OutputPath -OutputPath $TextOutput }
+        CsvOutput         = if ([string]::IsNullOrWhiteSpace($CsvOutput)) { $null } else { Resolve-OutputPath -OutputPath $CsvOutput }
     }
 }
 finally {
