@@ -56,6 +56,23 @@ After writing the requested output files, the script prints a short run summary
 with the ISO path, filesystem type, volume identifier, file count, and output
 paths.
 
+## Error Output
+
+Failures are reported as a structured PowerShell object instead of a raw stack
+trace. The object includes:
+
+- `Status`
+- `Stage`
+- `IsoPath`
+- `Error`
+- `Explanation`
+- `NextStep`
+
+For example, if the ISO-visible directory record claims more bytes than the
+script can read, the error explains that the media may be truncated, sparse,
+corrupt, or intentionally malformed, and recommends reacquiring the ISO and
+checking the whole-file hash against the source.
+
 ## Validation
 
 The scanner was validated against Debian 13.5.0 amd64 netinst from Debian's

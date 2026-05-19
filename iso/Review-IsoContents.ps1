@@ -389,8 +389,46 @@ function Export-TextManifest {
     [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
 }
 
-$resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-$stream = [System.IO.File]::Open($resolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+function Get-ErrorGuidance {
+    param([string]$Message)
+
+    if ($Message -like '*Specify -TextOutput or -CsvOutput*') {
+        return [pscustomobject]@{
+            Explanation = 'The script only writes manifests to files, and no output path was provided.'
+            NextStep    = 'Run again with -CsvOutput, -TextOutput, or both.'
+        }
+    }
+
+    if ($Message -like '*No readable ISO-9660/Joliet root directory*') {
+        return [pscustomobject]@{
+            Explanation = 'The image did not expose an ISO-9660 or Joliet root directory to this parser. It may be UDF-only, damaged, encrypted, or not an ISO image.'
+            NextStep    = 'Hash and preserve the ISO, verify it against vendor checksums/signatures, then inspect it with a parser that supports the image filesystem.'
+        }
+    }
+
+    if ($Message -like '*Unexpected end of ISO while hashing*') {
+        return [pscustomobject]@{
+            Explanation = 'A directory record claimed more bytes than could be read from the ISO. The image may be truncated, sparse, corrupt, or intentionally malformed.'
+            NextStep    = 'Re-download or reacquire the ISO, compare the whole-file hash against the source, and only trust manifests generated from complete media.'
+        }
+    }
+
+    if ($Message -like '*Access*denied*' -or $Message -like '*permission*') {
+        return [pscustomobject]@{
+            Explanation = 'PowerShell could not read the ISO or write one of the requested output files because of filesystem permissions.'
+            NextStep    = 'Check the ISO path, output directory permissions, and whether another process is locking the destination file.'
+        }
+    }
+
+    return [pscustomobject]@{
+        Explanation = 'An unexpected error occurred while parsing or writing the ISO manifest.'
+        NextStep    = 'Check that the input is a complete ISO-9660/Joliet image and that the output path is writable. Re-run with a fresh copy if the media may be corrupt.'
+    }
+}
+
+$resolvedPath = $null
+$stream = $null
+$stage = 'Start'
 
 try {
     # Main execution flow:
@@ -399,10 +437,16 @@ try {
     # 3. Traverse the selected root directory into file entries.
     # 4. Stream-hash each visible file and shorten SHA256 to 12 characters.
     # 5. Write text and/or CSV output, then print a small run summary.
+    $stage = 'Validate output arguments'
     if ([string]::IsNullOrWhiteSpace($TextOutput) -and [string]::IsNullOrWhiteSpace($CsvOutput)) {
         throw 'Specify -TextOutput or -CsvOutput.'
     }
 
+    $stage = 'Open ISO file'
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $stream = [System.IO.File]::Open($resolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+
+    $stage = 'Read ISO volume descriptors'
     $descriptors = @(Read-VolumeDescriptors -Stream $stream)
     $descriptor = $descriptors | Where-Object { $_.IsJoliet -and $_.RootRecord } | Select-Object -First 1
     if ($null -eq $descriptor) {
@@ -415,14 +459,19 @@ try {
         throw 'No readable ISO-9660/Joliet root directory was found. File contents cannot be listed with this PowerShell-only parser. Next cyber-relevant step: preserve and hash the ISO as an artifact, verify against vendor checksums/signatures, then inspect with a forensic ISO/UDF parser or isolated sandbox.'
     }
 
+    $stage = 'Traverse ISO directory tree'
     $entries = @(Get-IsoEntries -Stream $stream -RootRecord $descriptor.RootRecord -Joliet:$descriptor.IsJoliet)
+
+    $stage = 'Hash ISO-visible files'
     $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries)
 
     if (-not [string]::IsNullOrWhiteSpace($CsvOutput)) {
+        $stage = 'Write CSV manifest'
         $manifest | Export-Csv -LiteralPath (Resolve-OutputPath -OutputPath $CsvOutput) -NoTypeInformation
     }
 
     if (-not [string]::IsNullOrWhiteSpace($TextOutput)) {
+        $stage = 'Write text manifest'
         Export-TextManifest -Manifest $manifest -OutputPath $TextOutput
     }
 
@@ -435,6 +484,19 @@ try {
         CsvOutput         = if ([string]::IsNullOrWhiteSpace($CsvOutput)) { $null } else { Resolve-OutputPath -OutputPath $CsvOutput }
     }
 }
+catch {
+    $guidance = Get-ErrorGuidance -Message $_.Exception.Message
+    [pscustomobject]@{
+        Status      = 'Failed'
+        Stage       = $stage
+        IsoPath     = if ($resolvedPath) { $resolvedPath } else { $Path }
+        Error       = $_.Exception.Message
+        Explanation = $guidance.Explanation
+        NextStep    = $guidance.NextStep
+    }
+}
 finally {
-    $stream.Dispose()
+    if ($null -ne $stream) {
+        $stream.Dispose()
+    }
 }
