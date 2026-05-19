@@ -10,6 +10,8 @@ container CLIs.
 ## Contents
 
 - `go/` - Go module and dependency retrieval without invoking the Go toolchain.
+- `iso/` - ISO-9660/Joliet file listing, Linux installer summary, and per-file
+  checksum manifests without mounting the ISO.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
@@ -27,6 +29,29 @@ See [rust/README.md](rust/README.md) for examples and limitations.
 See [npm/README.md](npm/README.md) for examples and limitations.
 The npm directory also includes `Test-NpmPackageSample.ps1`, which randomly
 tests five packages from a checked-in popular-package sample list.
+
+## ISO Scan
+
+See [iso/README.md](iso/README.md) for examples and limitations.
+
+`iso/Review-IsoContents.ps1` inspects ISO-9660 and Joliet filesystems directly
+from the ISO bytes. It does not mount the image and does not require 7-Zip,
+`isoinfo`, `xorriso`, Linux loop devices, Windows image mounting cmdlets, or any
+other external tool.
+
+Common use:
+
+```powershell
+.\iso\Review-IsoContents.ps1 `
+  -Path .\debian-13.5.0-amd64-netinst.iso `
+  -LinuxSummary `
+  -FileChecksums `
+  -ChecksumCsv .\debian-13.5.0-amd64-netinst-file-manifest.csv
+```
+
+The checksum manifest lists each ISO-visible file with its path, size, modified
+time, checksum algorithm, and checksum. This is useful for cyber review,
+air-gap intake, provenance notes, and comparing installer media across sources.
 
 ## Podman Pull Replacement
 
