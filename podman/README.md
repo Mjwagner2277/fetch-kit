@@ -10,6 +10,8 @@ with PowerShell HTTP calls and writes an OCI image layout to disk.
 - Public images from GitLab Container Registry, including the GitLab analyzer
   image used in the offline container scanning documentation:
   `registry.gitlab.com/security-products/container-scanning:8`.
+- Public OCI artifacts from GHCR, including artifacts commonly retrieved with
+  ORAS such as `ghcr.io/aquasecurity/trivy-db:2`.
 - Private registry images when credentials are supplied.
 - Multi-architecture images, selecting a manifest with `-Platform`.
 
@@ -42,6 +44,12 @@ Pull by digest instead of tag:
 .\Get-ContainerImage.ps1 `
   -Image "alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc" `
   -SkipLayers
+```
+
+Pull an OCI artifact commonly retrieved with ORAS:
+
+```powershell
+.\Get-ContainerImage.ps1 -Image "ghcr.io/aquasecurity/trivy-db:2"
 ```
 
 Pull from an authenticated registry:
@@ -89,6 +97,8 @@ The test harness uses:
 - `registry.gitlab.com/security-products/container-scanning:8`, the image named
   by GitLab's offline container scanning `SOURCE_IMAGE` example.
 - `alpine:3.20`, to verify Docker Hub shorthand normalization.
+- `ghcr.io/aquasecurity/trivy-db:2`, to verify GHCR auth scope handling and
+  OCI artifact retrieval.
 
 By default the tests use `-SkipLayers` to avoid downloading large layers while
 still validating registry auth, manifest-list platform selection, config blob

@@ -387,7 +387,7 @@ function Get-RegistryAuthHeaders {
                 throw "Only bearer-token registry authentication is supported."
             }
 
-            $scope = if ($challenge.ContainsKey('scope')) { $challenge['scope'] } else { "repository:${Repository}:${Action}" }
+            $scope = "repository:${Repository}:${Action}"
             $query = @()
             if ($challenge.ContainsKey('service')) {
                 $query += 'service=' + (Get-UrlEncoded -Value $challenge['service'])

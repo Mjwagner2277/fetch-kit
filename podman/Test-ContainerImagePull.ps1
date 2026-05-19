@@ -83,6 +83,13 @@ $cases = @(
         ExpectedHost  = 'registry-1.docker.io'
         ExpectedRepo  = 'library/alpine'
         Source        = 'Docker Hub public image shorthand'
+    },
+    [pscustomobject]@{
+        Name          = 'GhcrTrivyDbArtifact'
+        Image         = 'ghcr.io/aquasecurity/trivy-db:2'
+        ExpectedHost  = 'ghcr.io'
+        ExpectedRepo  = 'aquasecurity/trivy-db'
+        Source        = 'Trivy DB OCI artifact commonly pulled with ORAS'
     }
 )
 
