@@ -4,17 +4,15 @@ Reviews the contents of an ISO file without mounting it.
 
 .DESCRIPTION
 Parses ISO-9660 and Joliet directory records directly from the ISO bytes using
-PowerShell only, then writes a compact per-file SHA256 manifest using 12-character
-short hashes.
+PowerShell only, then writes a combined text report with ISO-visible files,
+12-character short SHA256 hashes, and any RPM header metadata that can be read
+from directly visible .rpm files.
 
 .EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -CsvOutput .\sample-iso-manifest.csv
+.\Review-IsoContents.ps1 -Path .\sample.iso
 
 .EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -TextOutput .\sample-iso-manifest.txt
-
-.EXAMPLE
-.\Review-IsoContents.ps1 -Path .\sample.iso -CsvOutput .\sample-iso-manifest.csv -RpmCsvOutput .\sample-rpm-metadata.csv
+.\Review-IsoContents.ps1 -Path .\sample.iso -Output .\sample-iso-review.txt -CsvOutput .\sample-iso-review.csv
 #>
 
 [CmdletBinding()]
@@ -23,13 +21,9 @@ param(
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
     [string]$Path,
 
-    [string]$TextOutput,
+    [string]$Output,
 
-    [string]$CsvOutput,
-
-    [string]$RpmTextOutput,
-
-    [string]$RpmCsvOutput
+    [string]$CsvOutput
 )
 
 Set-StrictMode -Version Latest
@@ -400,21 +394,117 @@ function Resolve-OutputPath {
     return $resolved
 }
 
-function Export-TextManifest {
+function Export-ReviewReport {
     param(
-        [object[]]$Manifest,
+        [pscustomobject]$Summary,
+        [object[]]$FileManifest,
+        [object[]]$RpmManifest,
         [string]$OutputPath
     )
 
-    # Text output is tab-delimited so it stays simple to parse in PowerShell or
-    # spreadsheet tools while preserving paths with spaces.
+    # The default report is a single text file: a short summary, then all
+    # ISO-visible files, then visible RPM metadata and packaged file paths.
     $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('ISO Review Summary')
+    $lines.Add('==================')
+    $lines.Add("IsoPath`t$($Summary.IsoPath)")
+    $lines.Add("Filesystem`t$($Summary.Filesystem)")
+    $lines.Add("VolumeIdentifier`t$($Summary.VolumeIdentifier)")
+    $lines.Add("FileCount`t$($Summary.FileCount)")
+    $lines.Add("RpmRows`t$($RpmManifest.Count)")
+    $lines.Add('')
+    $lines.Add('ISO Visible Files')
+    $lines.Add('=================')
     $lines.Add("Path`tSize`tModified`tShortSha256")
-    foreach ($row in $Manifest) {
+    foreach ($row in $FileManifest) {
         $modified = if ($null -ne $row.Modified) { $row.Modified.ToString('s') } else { '' }
         $lines.Add("$($row.Path)`t$($row.Size)`t$modified`t$($row.ShortSha256)")
     }
+    $lines.Add('')
+    $lines.Add('Visible RPM Metadata')
+    $lines.Add('====================')
+    if ($RpmManifest.Count -eq 0) {
+        $lines.Add('No directly visible RPM files were found in the ISO filesystem.')
+    }
+    else {
+        $columns = @('RpmPath', 'Name', 'Version', 'Release', 'Epoch', 'Architecture', 'License', 'Summary', 'SourceRpm', 'PayloadFormat', 'PayloadCompressor', 'PackagedFilePath', 'ParseStatus', 'ParseError')
+        $lines.Add(($columns -join "`t"))
+        foreach ($row in $RpmManifest) {
+            $values = foreach ($column in $columns) {
+                (($row.$column -as [string]) -replace "`t", ' ' -replace "`r?`n", ' ')
+            }
+            $lines.Add(($values -join "`t"))
+        }
+    }
     [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
+}
+
+function Export-ReviewCsvReport {
+    param(
+        [object[]]$FileManifest,
+        [object[]]$RpmManifest,
+        [string]$OutputPath
+    )
+
+    # The optional CSV uses one wide schema so callers do not need separate
+    # outputs for ISO files and RPM header data.
+    $rows = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in $FileManifest) {
+        $rows.Add([pscustomobject]@{
+            RecordType        = 'ISOFile'
+            Path              = $file.Path
+            Size              = $file.Size
+            Modified          = $file.Modified
+            ShortSha256       = $file.ShortSha256
+            RpmPath           = ''
+            Name              = ''
+            Version           = ''
+            Release           = ''
+            Epoch             = ''
+            Architecture      = ''
+            License           = ''
+            Summary           = ''
+            SourceRpm         = ''
+            PayloadFormat     = ''
+            PayloadCompressor = ''
+            PackagedFilePath  = ''
+            ParseStatus       = ''
+            ParseError        = ''
+        })
+    }
+
+    foreach ($rpm in $RpmManifest) {
+        $rows.Add([pscustomobject]@{
+            RecordType        = 'RPMMetadata'
+            Path              = $rpm.PackagedFilePath
+            Size              = ''
+            Modified          = ''
+            ShortSha256       = ''
+            RpmPath           = $rpm.RpmPath
+            Name              = $rpm.Name
+            Version           = $rpm.Version
+            Release           = $rpm.Release
+            Epoch             = $rpm.Epoch
+            Architecture      = $rpm.Architecture
+            License           = $rpm.License
+            Summary           = $rpm.Summary
+            SourceRpm         = $rpm.SourceRpm
+            PayloadFormat     = $rpm.PayloadFormat
+            PayloadCompressor = $rpm.PayloadCompressor
+            PackagedFilePath  = $rpm.PackagedFilePath
+            ParseStatus       = $rpm.ParseStatus
+            ParseError        = $rpm.ParseError
+        })
+    }
+
+    $resolved = Resolve-OutputPath -OutputPath $OutputPath
+    if ($rows.Count -gt 0) {
+        $rows | Export-Csv -LiteralPath $resolved -NoTypeInformation
+        return
+    }
+
+    $header = '"RecordType","Path","Size","Modified","ShortSha256","RpmPath","Name","Version","Release","Epoch","Architecture","License","Summary","SourceRpm","PayloadFormat","PayloadCompressor","PackagedFilePath","ParseStatus","ParseError"'
+    [IO.File]::WriteAllLines($resolved, [string[]]@($header), [Text.Encoding]::UTF8)
 }
 
 function Read-IsoEntryPrefix {
@@ -689,49 +779,8 @@ function Get-RpmMetadataManifest {
     return @($rows)
 }
 
-function Export-RpmTextManifest {
-    param(
-        [object[]]$Manifest,
-        [string]$OutputPath
-    )
-
-    $columns = @('RpmPath', 'Name', 'Version', 'Release', 'Epoch', 'Architecture', 'License', 'Summary', 'SourceRpm', 'PayloadFormat', 'PayloadCompressor', 'PackagedFilePath', 'ParseStatus', 'ParseError')
-    $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add(($columns -join "`t"))
-    foreach ($row in $Manifest) {
-        $values = foreach ($column in $columns) {
-            (($row.$column -as [string]) -replace "`t", ' ' -replace "`r?`n", ' ')
-        }
-        $lines.Add(($values -join "`t"))
-    }
-    [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
-}
-
-function Export-RpmCsvManifest {
-    param(
-        [object[]]$Manifest,
-        [string]$OutputPath
-    )
-
-    $resolved = Resolve-OutputPath -OutputPath $OutputPath
-    if ($Manifest.Count -gt 0) {
-        $Manifest | Export-Csv -LiteralPath $resolved -NoTypeInformation
-        return
-    }
-
-    $header = '"RpmPath","Name","Version","Release","Epoch","Architecture","License","Summary","SourceRpm","PayloadFormat","PayloadCompressor","PackagedFilePath","ParseStatus","ParseError"'
-    [IO.File]::WriteAllLines($resolved, [string[]]@($header), [Text.Encoding]::UTF8)
-}
-
 function Get-ErrorGuidance {
     param([string]$Message)
-
-    if ($Message -like '*Specify -TextOutput*') {
-        return [pscustomobject]@{
-            Explanation = 'The script only writes manifests to files, and no output path was provided.'
-            NextStep    = 'Run again with -CsvOutput, -TextOutput, -RpmCsvOutput, -RpmTextOutput, or a combination.'
-        }
-    }
 
     if ($Message -like '*No readable ISO-9660/Joliet root directory*') {
         return [pscustomobject]@{
@@ -766,20 +815,17 @@ $stage = 'Start'
 
 try {
     # Main execution flow:
-    # 1. Require at least one output file target.
+    # 1. Resolve the default output path if the caller did not provide one.
     # 2. Read ISO volume descriptors and choose Joliet when available.
     # 3. Traverse the selected root directory into file entries.
-    # 4. Stream-hash visible files and/or parse visible RPM headers.
-    # 5. Write requested outputs, then print a small run summary.
-    $stage = 'Validate output arguments'
-    $hasFileManifestOutput = -not [string]::IsNullOrWhiteSpace($TextOutput) -or -not [string]::IsNullOrWhiteSpace($CsvOutput)
-    $hasRpmOutput = -not [string]::IsNullOrWhiteSpace($RpmTextOutput) -or -not [string]::IsNullOrWhiteSpace($RpmCsvOutput)
-    if (-not $hasFileManifestOutput -and -not $hasRpmOutput) {
-        throw 'Specify -TextOutput, -CsvOutput, -RpmTextOutput, or -RpmCsvOutput.'
-    }
-
+    # 4. Stream-hash visible files and parse visible RPM headers.
+    # 5. Write one text report, plus one optional combined CSV export.
     $stage = 'Open ISO file'
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    if ([string]::IsNullOrWhiteSpace($Output)) {
+        $baseName = [IO.Path]::GetFileNameWithoutExtension($resolvedPath)
+        $Output = Join-Path -Path (Get-Location).Path -ChildPath "$baseName-iso-review.txt"
+    }
     $stream = [System.IO.File]::Open($resolvedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
 
     $stage = 'Read ISO volume descriptors'
@@ -798,36 +844,25 @@ try {
     $stage = 'Traverse ISO directory tree'
     $entries = @(Get-IsoEntries -Stream $stream -RootRecord $descriptor.RootRecord -Joliet:$descriptor.IsJoliet)
 
-    $manifest = @()
-    if ($hasFileManifestOutput) {
-        $stage = 'Hash ISO-visible files'
-        $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries)
+    $stage = 'Hash ISO-visible files'
+    $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries)
+
+    $stage = 'Parse visible RPM headers'
+    $rpmManifest = @(Get-RpmMetadataManifest -Stream $stream -Entries $entries)
+
+    $summary = [pscustomobject]@{
+        IsoPath           = $resolvedPath
+        Filesystem        = if ($descriptor.IsJoliet) { 'Joliet / ISO-9660' } else { 'ISO-9660' }
+        VolumeIdentifier = $descriptor.VolumeIdentifier
+        FileCount         = @($entries | Where-Object { -not $_.IsDirectory }).Count
     }
 
-    $rpmManifest = @()
-    if ($hasRpmOutput) {
-        $stage = 'Parse visible RPM headers'
-        $rpmManifest = @(Get-RpmMetadataManifest -Stream $stream -Entries $entries)
-    }
+    $stage = 'Write text report'
+    Export-ReviewReport -Summary $summary -FileManifest $manifest -RpmManifest $rpmManifest -OutputPath $Output
 
     if (-not [string]::IsNullOrWhiteSpace($CsvOutput)) {
-        $stage = 'Write CSV manifest'
-        $manifest | Export-Csv -LiteralPath (Resolve-OutputPath -OutputPath $CsvOutput) -NoTypeInformation
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($TextOutput)) {
-        $stage = 'Write text manifest'
-        Export-TextManifest -Manifest $manifest -OutputPath $TextOutput
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($RpmCsvOutput)) {
-        $stage = 'Write RPM CSV manifest'
-        Export-RpmCsvManifest -Manifest $rpmManifest -OutputPath $RpmCsvOutput
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($RpmTextOutput)) {
-        $stage = 'Write RPM text manifest'
-        Export-RpmTextManifest -Manifest $rpmManifest -OutputPath $RpmTextOutput
+        $stage = 'Write optional CSV report'
+        Export-ReviewCsvReport -FileManifest $manifest -RpmManifest $rpmManifest -OutputPath $CsvOutput
     }
 
     [pscustomobject]@{
@@ -837,10 +872,8 @@ try {
         FileCount         = @($entries | Where-Object { -not $_.IsDirectory }).Count
         FileManifestRows  = $manifest.Count
         RpmManifestRows   = $rpmManifest.Count
-        TextOutput        = if ([string]::IsNullOrWhiteSpace($TextOutput)) { $null } else { Resolve-OutputPath -OutputPath $TextOutput }
+        Output            = Resolve-OutputPath -OutputPath $Output
         CsvOutput         = if ([string]::IsNullOrWhiteSpace($CsvOutput)) { $null } else { Resolve-OutputPath -OutputPath $CsvOutput }
-        RpmTextOutput     = if ([string]::IsNullOrWhiteSpace($RpmTextOutput)) { $null } else { Resolve-OutputPath -OutputPath $RpmTextOutput }
-        RpmCsvOutput      = if ([string]::IsNullOrWhiteSpace($RpmCsvOutput)) { $null } else { Resolve-OutputPath -OutputPath $RpmCsvOutput }
     }
 }
 catch {

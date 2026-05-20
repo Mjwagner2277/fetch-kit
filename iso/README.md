@@ -2,18 +2,17 @@
 
 `Review-IsoContents.ps1` reviews ISO contents without mounting the image. It
 parses ISO-9660 and Joliet directory records directly from the ISO bytes using
-PowerShell only, then writes a compact per-file manifest.
+PowerShell only, then writes one combined text report with visible file hashes
+and whatever RPM header data can be extracted from directly visible `.rpm`
+files.
 
 The public interface is intentionally small:
 
 - `-Path` - ISO file to inspect.
-- `-TextOutput` - write a tab-delimited text manifest.
-- `-CsvOutput` - write a CSV manifest.
-- `-RpmTextOutput` - write visible RPM metadata and packaged file paths as tab-delimited text.
-- `-RpmCsvOutput` - write visible RPM metadata and packaged file paths as CSV.
-
-Specify one or more output paths. File manifests and RPM metadata outputs can be
-requested in the same run.
+- `-Output` - optional combined text report path. Defaults to
+  `<iso-name>-iso-review.txt` in the current directory.
+- `-CsvOutput` - optional combined CSV export with ISO-visible files and visible
+  RPM metadata rows.
 
 ## Quick Start
 
@@ -21,31 +20,40 @@ From the `fetch-kit` repository root:
 
 ```powershell
 .\iso\Review-IsoContents.ps1 `
-  -Path .\debian-13.5.0-amd64-netinst.iso `
-  -CsvOutput .\debian-13.5.0-amd64-netinst-file-manifest.csv
+  -Path .\debian-13.5.0-amd64-netinst.iso
 ```
 
-Write both text and CSV:
+This writes `.\debian-13.5.0-amd64-netinst-iso-review.txt` by default. The
+report includes a summary, every ISO-visible file with a short SHA256 value, and
+a visible RPM metadata section. Debian installer media normally has no directly
+visible RPMs, so that section will say none were found.
+
+Choose the report path:
 
 ```powershell
 .\iso\Review-IsoContents.ps1 `
   -Path .\debian-13.5.0-amd64-netinst.iso `
-  -TextOutput .\debian-13.5.0-amd64-netinst-file-manifest.txt `
-  -CsvOutput .\debian-13.5.0-amd64-netinst-file-manifest.csv
+  -Output .\debian-iso-review.txt
 ```
 
-Write a file manifest and visible RPM metadata in one pass:
+Optionally write CSVs for spreadsheet or diff workflows:
 
 ```powershell
 .\iso\Review-IsoContents.ps1 `
   -Path .\rhel-family-dvd.iso `
-  -CsvOutput .\iso-file-manifest.csv `
-  -RpmCsvOutput .\iso-rpm-metadata.csv
+  -Output .\rhel-family-iso-review.txt `
+  -CsvOutput .\rhel-family-iso-review.csv
 ```
 
 ## Output
 
-The file manifest lists one ISO-visible file per row with:
+The default text report has three sections:
+
+- `ISO Review Summary`
+- `ISO Visible Files`
+- `Visible RPM Metadata`
+
+The file section lists one ISO-visible file per row with:
 
 - `Path`
 - `Size`
@@ -56,24 +64,27 @@ The file manifest lists one ISO-visible file per row with:
 similar in spirit to a short Git SHA. It is intended for quick review and
 comparison, not as a full cryptographic identifier.
 
-Example CSV rows:
+Example report rows:
 
-```csv
-"Path","Size","Modified","ShortSha256"
-"\.disk\base_components","5","5/16/2026 10:10:55 AM","6403203dd5a0"
-"\.disk\base_installable","0","5/16/2026 10:12:17 AM","e3b0c44298fc"
+```text
+Path	Size	Modified	ShortSha256
+\.disk\base_components	5	2026-05-16T10:10:55	6403203dd5a0
+\.disk\base_installable	0	2026-05-16T10:12:17	e3b0c44298fc
 ```
 
-After writing the requested output files, the script prints a short run summary
+After writing the output files, the script prints a short run summary
 with the ISO path, filesystem type, volume identifier, file count, and output
 paths.
 
+The optional CSV uses one wide schema. ISO file rows use `RecordType` =
+`ISOFile`; RPM rows use `RecordType` = `RPMMetadata`.
+
 ## RPM Metadata Output
 
-When `-RpmCsvOutput` or `-RpmTextOutput` is supplied, the script looks for
-`.rpm` files that are directly visible in the ISO filesystem and parses their
-RPM headers. The output repeats package metadata next to each packaged file path
-when the RPM header exposes a file list.
+The default text report always looks for `.rpm` files that are directly visible
+in the ISO filesystem and parses their RPM headers. The output repeats package
+metadata next to each packaged file path when the RPM header exposes a file
+list. `-CsvOutput` includes these rows in the same CSV as the ISO file list.
 
 RPM output columns are:
 

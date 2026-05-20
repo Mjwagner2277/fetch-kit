@@ -43,23 +43,23 @@ Common use:
 
 ```powershell
 .\iso\Review-IsoContents.ps1 `
-  -Path .\debian-13.5.0-amd64-netinst.iso `
-  -CsvOutput .\debian-13.5.0-amd64-netinst-file-manifest.csv
+  -Path .\debian-13.5.0-amd64-netinst.iso
 ```
 
-The manifest lists each ISO-visible file with its path, size, modified time, and
-12-character `ShortSha256` value. This is useful for cyber review, air-gap
-intake, provenance notes, and quick comparison of installer media across
-sources.
+By default, the script writes `<iso-name>-iso-review.txt` in the current
+directory. The report lists each ISO-visible file with its path, size, modified
+time, and 12-character `ShortSha256` value, then includes visible RPM metadata
+and packaged file paths when directly visible `.rpm` files are present. This is
+useful for cyber review, air-gap intake, provenance notes, and quick comparison
+of installer media across sources.
 
-For installer media with directly visible `.rpm` files, the same script can
-also write RPM header metadata and packaged file paths:
+CSV exports are optional for spreadsheet or diff workflows:
 
 ```powershell
 .\iso\Review-IsoContents.ps1 `
   -Path .\rhel-family-dvd.iso `
-  -CsvOutput .\iso-file-manifest.csv `
-  -RpmCsvOutput .\iso-rpm-metadata.csv
+  -Output .\rhel-family-iso-review.txt `
+  -CsvOutput .\rhel-family-iso-review.csv
 ```
 
 ## Podman Pull Replacement
