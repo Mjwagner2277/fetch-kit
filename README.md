@@ -10,7 +10,8 @@ container CLIs.
 ## Contents
 
 - `go/` - Go module and dependency retrieval without invoking the Go toolchain.
-- `iso/` - ISO-9660/Joliet short-hash file manifests without mounting the ISO.
+- `iso/` - ISO-9660/Joliet short-hash file manifests and visible RPM metadata
+  without mounting the ISO.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
@@ -50,6 +51,16 @@ The manifest lists each ISO-visible file with its path, size, modified time, and
 12-character `ShortSha256` value. This is useful for cyber review, air-gap
 intake, provenance notes, and quick comparison of installer media across
 sources.
+
+For installer media with directly visible `.rpm` files, the same script can
+also write RPM header metadata and packaged file paths:
+
+```powershell
+.\iso\Review-IsoContents.ps1 `
+  -Path .\rhel-family-dvd.iso `
+  -CsvOutput .\iso-file-manifest.csv `
+  -RpmCsvOutput .\iso-rpm-metadata.csv
+```
 
 ## Podman Pull Replacement
 

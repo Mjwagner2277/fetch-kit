@@ -9,8 +9,11 @@ The public interface is intentionally small:
 - `-Path` - ISO file to inspect.
 - `-TextOutput` - write a tab-delimited text manifest.
 - `-CsvOutput` - write a CSV manifest.
+- `-RpmTextOutput` - write visible RPM metadata and packaged file paths as tab-delimited text.
+- `-RpmCsvOutput` - write visible RPM metadata and packaged file paths as CSV.
 
-Specify `-TextOutput`, `-CsvOutput`, or both.
+Specify one or more output paths. File manifests and RPM metadata outputs can be
+requested in the same run.
 
 ## Quick Start
 
@@ -31,9 +34,18 @@ Write both text and CSV:
   -CsvOutput .\debian-13.5.0-amd64-netinst-file-manifest.csv
 ```
 
+Write a file manifest and visible RPM metadata in one pass:
+
+```powershell
+.\iso\Review-IsoContents.ps1 `
+  -Path .\rhel-family-dvd.iso `
+  -CsvOutput .\iso-file-manifest.csv `
+  -RpmCsvOutput .\iso-rpm-metadata.csv
+```
+
 ## Output
 
-The manifest lists one ISO-visible file per row with:
+The file manifest lists one ISO-visible file per row with:
 
 - `Path`
 - `Size`
@@ -55,6 +67,32 @@ Example CSV rows:
 After writing the requested output files, the script prints a short run summary
 with the ISO path, filesystem type, volume identifier, file count, and output
 paths.
+
+## RPM Metadata Output
+
+When `-RpmCsvOutput` or `-RpmTextOutput` is supplied, the script looks for
+`.rpm` files that are directly visible in the ISO filesystem and parses their
+RPM headers. The output repeats package metadata next to each packaged file path
+when the RPM header exposes a file list.
+
+RPM output columns are:
+
+- `RpmPath`
+- `Name`
+- `Version`
+- `Release`
+- `Epoch`
+- `Architecture`
+- `License`
+- `Summary`
+- `SourceRpm`
+- `PayloadFormat`
+- `PayloadCompressor`
+- `PackagedFilePath`
+- `ParseStatus`
+- `ParseError`
+
+This reads RPM metadata only. It does not decompress or unpack the RPM payload.
 
 ## Error Output
 
@@ -78,6 +116,11 @@ checking the whole-file hash against the source.
 - The script hashes ISO-visible files, not every file inside nested payloads.
   For example, `install.img`, `initrd.gz`, `.deb`, `.rpm`, SquashFS images, and
   archives are hashed as container files.
+- RPM metadata parsing only applies to `.rpm` files directly visible in the ISO
+  filesystem. RPMs inside `install.img`, SquashFS images, or other nested
+  payloads are not reached.
+- RPM output comes from header metadata. The script does not unpack RPM payloads
+  or verify payload file contents.
 - `ShortSha256` is a shortened review value. Use full SHA256 if you need strong
   identity or collision-resistant matching.
 - It does not unpack package files, initramfs images, SquashFS images, or

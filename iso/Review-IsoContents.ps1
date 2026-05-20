@@ -12,6 +12,9 @@ short hashes.
 
 .EXAMPLE
 .\Review-IsoContents.ps1 -Path .\sample.iso -TextOutput .\sample-iso-manifest.txt
+
+.EXAMPLE
+.\Review-IsoContents.ps1 -Path .\sample.iso -CsvOutput .\sample-iso-manifest.csv -RpmCsvOutput .\sample-rpm-metadata.csv
 #>
 
 [CmdletBinding()]
@@ -22,7 +25,11 @@ param(
 
     [string]$TextOutput,
 
-    [string]$CsvOutput
+    [string]$CsvOutput,
+
+    [string]$RpmTextOutput,
+
+    [string]$RpmCsvOutput
 )
 
 Set-StrictMode -Version Latest
@@ -61,6 +68,27 @@ function Convert-UInt16LE {
 function Convert-UInt32LE {
     param([byte[]]$Bytes, [int]$Offset)
     return [BitConverter]::ToUInt32($Bytes, $Offset)
+}
+
+function Convert-UInt16BE {
+    param([byte[]]$Bytes, [int]$Offset)
+    return [uint16](([uint16]$Bytes[$Offset] * 256) + [uint16]$Bytes[$Offset + 1])
+}
+
+function Convert-UInt32BE {
+    param([byte[]]$Bytes, [int]$Offset)
+    return [uint32](([uint32]$Bytes[$Offset] * 16777216) + ([uint32]$Bytes[$Offset + 1] * 65536) + ([uint32]$Bytes[$Offset + 2] * 256) + [uint32]$Bytes[$Offset + 3])
+}
+
+function Align-Offset {
+    param(
+        [Int64]$Offset,
+        [int]$Alignment
+    )
+
+    $remainder = $Offset % $Alignment
+    if ($remainder -eq 0) { return $Offset }
+    return $Offset + ($Alignment - $remainder)
 }
 
 function Convert-IsoDate {
@@ -389,13 +417,319 @@ function Export-TextManifest {
     [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
 }
 
+function Read-IsoEntryPrefix {
+    param(
+        [System.IO.FileStream]$Stream,
+        [pscustomobject]$Entry,
+        [Int64]$MaxBytes = 64MB
+    )
+
+    $readLength = [int][Math]::Min([Int64]$Entry.Size, [Int64]$MaxBytes)
+    if ($readLength -le 0) { return ,([byte[]]::new(0)) }
+    return ,(Read-Bytes -Stream $Stream -Offset ([Int64]$Entry.Extent * $SectorSize) -Count $readLength)
+}
+
+function Read-RpmHeader {
+    param(
+        [byte[]]$Bytes,
+        [int]$Offset
+    )
+
+    if (($Offset + 16) -gt $Bytes.Length) {
+        throw "RPM header at offset $Offset is truncated."
+    }
+
+    if ($Bytes[$Offset] -ne 0x8E -or $Bytes[$Offset + 1] -ne 0xAD -or $Bytes[$Offset + 2] -ne 0xE8) {
+        throw "RPM header magic not found at offset $Offset."
+    }
+
+    $indexCount = [int](Convert-UInt32BE -Bytes $Bytes -Offset ($Offset + 8))
+    $storeLength = [int](Convert-UInt32BE -Bytes $Bytes -Offset ($Offset + 12))
+    $indexOffset = $Offset + 16
+    $storeOffset = $indexOffset + ($indexCount * 16)
+    $endOffset = $storeOffset + $storeLength
+
+    if ($endOffset -gt $Bytes.Length) {
+        throw "RPM header store is truncated. Need $endOffset bytes but only read $($Bytes.Length)."
+    }
+
+    $entries = @{}
+    for ($i = 0; $i -lt $indexCount; $i++) {
+        $entryOffset = $indexOffset + ($i * 16)
+        $tag = [int](Convert-UInt32BE -Bytes $Bytes -Offset $entryOffset)
+        $type = [int](Convert-UInt32BE -Bytes $Bytes -Offset ($entryOffset + 4))
+        $dataOffset = [int](Convert-UInt32BE -Bytes $Bytes -Offset ($entryOffset + 8))
+        $count = [int](Convert-UInt32BE -Bytes $Bytes -Offset ($entryOffset + 12))
+        $entries[$tag] = [pscustomobject]@{
+            Tag         = $tag
+            Type        = $type
+            Offset      = $dataOffset
+            Count       = $count
+            StoreOffset = $storeOffset
+            StoreLength = $storeLength
+        }
+    }
+
+    [pscustomobject]@{
+        Entries  = $entries
+        EndOffset = $endOffset
+    }
+}
+
+function Read-NullTerminatedString {
+    param(
+        [byte[]]$Bytes,
+        [int]$Offset,
+        [int]$Limit
+    )
+
+    $end = $Offset
+    while ($end -lt $Limit -and $Bytes[$end] -ne 0) {
+        $end++
+    }
+    if ($end -le $Offset) { return '' }
+    return [Text.Encoding]::UTF8.GetString($Bytes, $Offset, $end - $Offset)
+}
+
+function Get-RpmTagValue {
+    param(
+        [byte[]]$Bytes,
+        [hashtable]$Entries,
+        [int]$Tag
+    )
+
+    if (-not $Entries.ContainsKey($Tag)) { return $null }
+    $entry = $Entries[$Tag]
+    $dataStart = [int]$entry.StoreOffset + [int]$entry.Offset
+    $dataLimit = [int]$entry.StoreOffset + [int]$entry.StoreLength
+
+    switch ($entry.Type) {
+        3 {
+            $values = [System.Collections.Generic.List[object]]::new()
+            for ($i = 0; $i -lt $entry.Count; $i++) {
+                $values.Add((Convert-UInt16BE -Bytes $Bytes -Offset ($dataStart + ($i * 2))))
+            }
+            return @($values.ToArray())
+        }
+        4 {
+            $values = [System.Collections.Generic.List[object]]::new()
+            for ($i = 0; $i -lt $entry.Count; $i++) {
+                $values.Add(([int32](Convert-UInt32BE -Bytes $Bytes -Offset ($dataStart + ($i * 4)))))
+            }
+            return @($values.ToArray())
+        }
+        6 {
+            return Read-NullTerminatedString -Bytes $Bytes -Offset $dataStart -Limit $dataLimit
+        }
+        { $_ -eq 8 -or $_ -eq 9 } {
+            $strings = [System.Collections.Generic.List[string]]::new()
+            $cursor = $dataStart
+            for ($i = 0; $i -lt $entry.Count -and $cursor -lt $dataLimit; $i++) {
+                $value = Read-NullTerminatedString -Bytes $Bytes -Offset $cursor -Limit $dataLimit
+                $strings.Add($value)
+                $cursor += ([Text.Encoding]::UTF8.GetByteCount($value) + 1)
+            }
+            return @($strings.ToArray())
+        }
+        default {
+            return $null
+        }
+    }
+}
+
+function Get-RpmScalarTag {
+    param(
+        [byte[]]$Bytes,
+        [hashtable]$Entries,
+        [int]$Tag
+    )
+
+    $value = Get-RpmTagValue -Bytes $Bytes -Entries $Entries -Tag $Tag
+    if ($null -eq $value) { return $null }
+    if ($value -is [array]) {
+        if ($value.Count -eq 0) { return $null }
+        return $value[0]
+    }
+    return $value
+}
+
+function Get-RpmPackagedFiles {
+    param(
+        [byte[]]$Bytes,
+        [hashtable]$Entries
+    )
+
+    $oldFileNamesValue = Get-RpmTagValue -Bytes $Bytes -Entries $Entries -Tag 1027
+    [object[]]$oldFileNames = @()
+    if ($null -ne $oldFileNamesValue) { $oldFileNames = @($oldFileNamesValue) }
+    if ($oldFileNames.Count -gt 0) {
+        return $oldFileNames
+    }
+
+    $dirIndexesValue = Get-RpmTagValue -Bytes $Bytes -Entries $Entries -Tag 1116
+    $baseNamesValue = Get-RpmTagValue -Bytes $Bytes -Entries $Entries -Tag 1117
+    $dirNamesValue = Get-RpmTagValue -Bytes $Bytes -Entries $Entries -Tag 1118
+    [object[]]$dirIndexes = @()
+    [object[]]$baseNames = @()
+    [object[]]$dirNames = @()
+    if ($null -ne $dirIndexesValue) { $dirIndexes = @($dirIndexesValue) }
+    if ($null -ne $baseNamesValue) { $baseNames = @($baseNamesValue) }
+    if ($null -ne $dirNamesValue) { $dirNames = @($dirNamesValue) }
+    if ($baseNames.Count -eq 0 -or $dirNames.Count -eq 0 -or $dirIndexes.Count -eq 0) {
+        return @()
+    }
+
+    $files = [System.Collections.Generic.List[string]]::new()
+    for ($i = 0; $i -lt $baseNames.Count; $i++) {
+        $dirIndex = [int]$dirIndexes[$i]
+        $dirName = if ($dirIndex -ge 0 -and $dirIndex -lt $dirNames.Count) { $dirNames[$dirIndex] } else { '' }
+        $files.Add($dirName + $baseNames[$i])
+    }
+    return @($files.ToArray())
+}
+
+function Read-RpmMetadata {
+    param(
+        [System.IO.FileStream]$Stream,
+        [pscustomobject]$Entry
+    )
+
+    $bytes = Read-IsoEntryPrefix -Stream $Stream -Entry $Entry
+    if ($bytes.Length -lt 120) {
+        throw "RPM file $($Entry.Path) is too small to contain RPM headers."
+    }
+
+    if ($bytes[0] -ne 0xED -or $bytes[1] -ne 0xAB -or $bytes[2] -ne 0xEE -or $bytes[3] -ne 0xDB) {
+        throw "RPM lead magic not found in $($Entry.Path)."
+    }
+
+    $signatureHeader = Read-RpmHeader -Bytes $bytes -Offset 96
+    $mainHeaderOffset = [int](Align-Offset -Offset $signatureHeader.EndOffset -Alignment 8)
+    $mainHeader = Read-RpmHeader -Bytes $bytes -Offset $mainHeaderOffset
+    $entries = $mainHeader.Entries
+
+    $files = @(Get-RpmPackagedFiles -Bytes $bytes -Entries $entries)
+    [pscustomobject]@{
+        RpmPath           = $Entry.Path
+        Name              = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1000
+        Version           = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1001
+        Release           = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1002
+        Epoch             = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1003
+        Architecture      = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1022
+        License           = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1014
+        Summary           = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1004
+        SourceRpm         = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1044
+        PayloadFormat     = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1124
+        PayloadCompressor = Get-RpmScalarTag -Bytes $bytes -Entries $entries -Tag 1125
+        PackagedFiles     = $files
+    }
+}
+
+function Get-RpmMetadataManifest {
+    param(
+        [System.IO.FileStream]$Stream,
+        [object[]]$Entries
+    )
+
+    $rpms = @($Entries | Where-Object { -not $_.IsDirectory -and $_.Path -like '*.rpm' } | Sort-Object Path)
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+
+    foreach ($rpm in $rpms) {
+        $index++
+        Write-Progress -Activity 'Parsing visible RPM headers' -Status $rpm.Path -PercentComplete (($index / [Math]::Max($rpms.Count, 1)) * 100)
+
+        try {
+            $metadata = Read-RpmMetadata -Stream $Stream -Entry $rpm
+            $files = @($metadata.PackagedFiles)
+            if ($files.Count -eq 0) {
+                $files = @('')
+            }
+
+            foreach ($file in $files) {
+                $rows.Add([pscustomobject]@{
+                    RpmPath           = $metadata.RpmPath
+                    Name              = $metadata.Name
+                    Version           = $metadata.Version
+                    Release           = $metadata.Release
+                    Epoch             = $metadata.Epoch
+                    Architecture      = $metadata.Architecture
+                    License           = $metadata.License
+                    Summary           = $metadata.Summary
+                    SourceRpm         = $metadata.SourceRpm
+                    PayloadFormat     = $metadata.PayloadFormat
+                    PayloadCompressor = $metadata.PayloadCompressor
+                    PackagedFilePath  = $file
+                    ParseStatus       = 'OK'
+                    ParseError        = ''
+                })
+            }
+        }
+        catch {
+            $rows.Add([pscustomobject]@{
+                RpmPath           = $rpm.Path
+                Name              = ''
+                Version           = ''
+                Release           = ''
+                Epoch             = ''
+                Architecture      = ''
+                License           = ''
+                Summary           = ''
+                SourceRpm         = ''
+                PayloadFormat     = ''
+                PayloadCompressor = ''
+                PackagedFilePath  = ''
+                ParseStatus       = 'Failed'
+                ParseError        = $_.Exception.Message
+            })
+        }
+    }
+
+    Write-Progress -Activity 'Parsing visible RPM headers' -Completed
+    return @($rows)
+}
+
+function Export-RpmTextManifest {
+    param(
+        [object[]]$Manifest,
+        [string]$OutputPath
+    )
+
+    $columns = @('RpmPath', 'Name', 'Version', 'Release', 'Epoch', 'Architecture', 'License', 'Summary', 'SourceRpm', 'PayloadFormat', 'PayloadCompressor', 'PackagedFilePath', 'ParseStatus', 'ParseError')
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add(($columns -join "`t"))
+    foreach ($row in $Manifest) {
+        $values = foreach ($column in $columns) {
+            (($row.$column -as [string]) -replace "`t", ' ' -replace "`r?`n", ' ')
+        }
+        $lines.Add(($values -join "`t"))
+    }
+    [IO.File]::WriteAllLines((Resolve-OutputPath -OutputPath $OutputPath), $lines, [Text.Encoding]::UTF8)
+}
+
+function Export-RpmCsvManifest {
+    param(
+        [object[]]$Manifest,
+        [string]$OutputPath
+    )
+
+    $resolved = Resolve-OutputPath -OutputPath $OutputPath
+    if ($Manifest.Count -gt 0) {
+        $Manifest | Export-Csv -LiteralPath $resolved -NoTypeInformation
+        return
+    }
+
+    $header = '"RpmPath","Name","Version","Release","Epoch","Architecture","License","Summary","SourceRpm","PayloadFormat","PayloadCompressor","PackagedFilePath","ParseStatus","ParseError"'
+    [IO.File]::WriteAllLines($resolved, [string[]]@($header), [Text.Encoding]::UTF8)
+}
+
 function Get-ErrorGuidance {
     param([string]$Message)
 
-    if ($Message -like '*Specify -TextOutput or -CsvOutput*') {
+    if ($Message -like '*Specify -TextOutput*') {
         return [pscustomobject]@{
             Explanation = 'The script only writes manifests to files, and no output path was provided.'
-            NextStep    = 'Run again with -CsvOutput, -TextOutput, or both.'
+            NextStep    = 'Run again with -CsvOutput, -TextOutput, -RpmCsvOutput, -RpmTextOutput, or a combination.'
         }
     }
 
@@ -435,11 +769,13 @@ try {
     # 1. Require at least one output file target.
     # 2. Read ISO volume descriptors and choose Joliet when available.
     # 3. Traverse the selected root directory into file entries.
-    # 4. Stream-hash each visible file and shorten SHA256 to 12 characters.
-    # 5. Write text and/or CSV output, then print a small run summary.
+    # 4. Stream-hash visible files and/or parse visible RPM headers.
+    # 5. Write requested outputs, then print a small run summary.
     $stage = 'Validate output arguments'
-    if ([string]::IsNullOrWhiteSpace($TextOutput) -and [string]::IsNullOrWhiteSpace($CsvOutput)) {
-        throw 'Specify -TextOutput or -CsvOutput.'
+    $hasFileManifestOutput = -not [string]::IsNullOrWhiteSpace($TextOutput) -or -not [string]::IsNullOrWhiteSpace($CsvOutput)
+    $hasRpmOutput = -not [string]::IsNullOrWhiteSpace($RpmTextOutput) -or -not [string]::IsNullOrWhiteSpace($RpmCsvOutput)
+    if (-not $hasFileManifestOutput -and -not $hasRpmOutput) {
+        throw 'Specify -TextOutput, -CsvOutput, -RpmTextOutput, or -RpmCsvOutput.'
     }
 
     $stage = 'Open ISO file'
@@ -462,8 +798,17 @@ try {
     $stage = 'Traverse ISO directory tree'
     $entries = @(Get-IsoEntries -Stream $stream -RootRecord $descriptor.RootRecord -Joliet:$descriptor.IsJoliet)
 
-    $stage = 'Hash ISO-visible files'
-    $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries)
+    $manifest = @()
+    if ($hasFileManifestOutput) {
+        $stage = 'Hash ISO-visible files'
+        $manifest = @(Get-IsoFileManifest -Stream $stream -Entries $entries)
+    }
+
+    $rpmManifest = @()
+    if ($hasRpmOutput) {
+        $stage = 'Parse visible RPM headers'
+        $rpmManifest = @(Get-RpmMetadataManifest -Stream $stream -Entries $entries)
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($CsvOutput)) {
         $stage = 'Write CSV manifest'
@@ -475,13 +820,27 @@ try {
         Export-TextManifest -Manifest $manifest -OutputPath $TextOutput
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($RpmCsvOutput)) {
+        $stage = 'Write RPM CSV manifest'
+        Export-RpmCsvManifest -Manifest $rpmManifest -OutputPath $RpmCsvOutput
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RpmTextOutput)) {
+        $stage = 'Write RPM text manifest'
+        Export-RpmTextManifest -Manifest $rpmManifest -OutputPath $RpmTextOutput
+    }
+
     [pscustomobject]@{
         IsoPath           = $resolvedPath
         Filesystem        = if ($descriptor.IsJoliet) { 'Joliet / ISO-9660' } else { 'ISO-9660' }
         VolumeIdentifier = $descriptor.VolumeIdentifier
-        FileCount         = $manifest.Count
+        FileCount         = @($entries | Where-Object { -not $_.IsDirectory }).Count
+        FileManifestRows  = $manifest.Count
+        RpmManifestRows   = $rpmManifest.Count
         TextOutput        = if ([string]::IsNullOrWhiteSpace($TextOutput)) { $null } else { Resolve-OutputPath -OutputPath $TextOutput }
         CsvOutput         = if ([string]::IsNullOrWhiteSpace($CsvOutput)) { $null } else { Resolve-OutputPath -OutputPath $CsvOutput }
+        RpmTextOutput     = if ([string]::IsNullOrWhiteSpace($RpmTextOutput)) { $null } else { Resolve-OutputPath -OutputPath $RpmTextOutput }
+        RpmCsvOutput      = if ([string]::IsNullOrWhiteSpace($RpmCsvOutput)) { $null } else { Resolve-OutputPath -OutputPath $RpmCsvOutput }
     }
 }
 catch {
