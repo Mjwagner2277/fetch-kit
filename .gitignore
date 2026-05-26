@@ -4,3 +4,5 @@ sample-results/
 sample-results*/
 *.log
 .DS_Store
+grype-db-cache/
+

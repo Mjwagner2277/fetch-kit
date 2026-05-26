@@ -13,6 +13,7 @@ container CLIs.
 - `iso/` - ISO-9660/Joliet short-hash file manifests and visible RPM metadata
   without mounting the ISO.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
+- `grype/` - Grype vulnerability database retrieval without invoking Grype.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
 
@@ -29,6 +30,12 @@ See [rust/README.md](rust/README.md) for examples and limitations.
 See [npm/README.md](npm/README.md) for examples and limitations.
 The npm directory also includes `Test-NpmPackageSample.ps1`, which randomly
 tests five packages from a checked-in popular-package sample list.
+
+## Grype Database
+
+See [grype/README.md](grype/README.md) for examples. `Get-GrypeDatabase.ps1`
+downloads the latest Grype vulnerability database archive and verifies its
+SHA-256 checksum without calling the Grype CLI.
 
 ## ISO Scan
 
@@ -65,3 +72,4 @@ CSV exports are optional for spreadsheet or diff workflows:
 ## Podman Pull Replacement
 
 See [podman/README.md](podman/README.md) for examples and limitations.
+
