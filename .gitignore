@@ -5,4 +5,10 @@ sample-results*/
 *.log
 .DS_Store
 grype-db-cache/
-
+rhel9-rpm-cache/
+el9-rpm-bundle/
+rhel96-container-sample*/
+sample-openh264-test/
+*-localrepo.tar.gz
+*.rpm
+metadata-cache/

@@ -15,6 +15,8 @@ container CLIs.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
 - `grype/` - Grype vulnerability database retrieval without invoking Grype.
 - `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
+- `rpm/` - RHEL-compatible EL9 RPM dependency retrieval without invoking DNF,
+  RPM, or Red Hat subscription workflows.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
 
 ## Go
@@ -30,6 +32,13 @@ See [rust/README.md](rust/README.md) for examples and limitations.
 See [npm/README.md](npm/README.md) for examples and limitations.
 The npm directory also includes `Test-NpmPackageSample.ps1`, which randomly
 tests five packages from a checked-in popular-package sample list.
+
+## RPM
+
+See [rpm/README.md](rpm/README.md) for examples and limitations.
+`rpm/Get-Rhel9RpmClosure.ps1` downloads RHEL 9-compatible RPMs and their
+dependency closure from public rpm-md repositories, then writes a local DNF repo
+that can be transferred to an airgapped environment.
 
 ## Grype Database
 
@@ -72,4 +81,3 @@ CSV exports are optional for spreadsheet or diff workflows:
 ## Podman Pull Replacement
 
 See [podman/README.md](podman/README.md) for examples and limitations.
-
