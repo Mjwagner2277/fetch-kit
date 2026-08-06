@@ -105,17 +105,19 @@ The generated `manifests/airgap-el9.repo` is a starting point for the target
 host. Adjust its `baseurl=file:///...` path after placing the bundle on the
 airgapped system.
 
-## Validation VM
+## Validation Path
 
-`rpm/lima-rocky96-x86_64.yaml` defines a disposable Rocky Linux 9.6 x86_64 VM for
-local DNF validation when a real RHEL 9.6 VM is not available:
+The preferred validation target is a representative RHEL 9 x86_64 host matching
+the intended airgapped baseline. The bundle should be copied or mounted there,
+all external repositories should be disabled for the validation transaction, and
+DNF should resolve the requested sample package set from only the generated
+`file://` repository.
 
-```bash
-limactl start --name codex-rocky96-x86 --tty=false rpm/lima-rocky96-x86_64.yaml
-limactl shell codex-rocky96-x86
-```
-
-The VM mounts this workspace at `/workspace`.
+When a RHEL host is not available, a RHEL-compatible EL9 system such as Rocky
+Linux 9 can be used as a preflight check for dependency completeness. That
+preflight is useful, but it is not a substitute for final validation on the
+actual RHEL target because Red Hat release packages, support boundaries, module
+state, installed baselines, and entitlement-only content can differ.
 
 ## Important Limits
 
