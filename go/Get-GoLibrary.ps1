@@ -12,11 +12,12 @@ It supports:
 
 It intentionally does not compile, install, or resolve the full Go module
 graph. Passing -Module selects single Go module retrieval. Passing
--PackageListPath selects Go module retrieval for every module/version pair in a text file.
-Passing -GoProxyDirectory also writes retrieved proxy modules in static Go
-proxy protocol layout for transfer to an internal proxy host. When
--GoProxyDirectory is used without -OutputDirectory or -Expand, the script uses
-a temporary working cache and removes it after the proxy export is written.
+-PackageListPath selects Go module retrieval for every module/version pair in a
+text file and writes retrieved proxy modules to static Go proxy layout by
+default. Passing -GoProxyDirectory selects a different static proxy output
+directory. When -GoProxyDirectory is used without -OutputDirectory or -Expand,
+the script uses a temporary working cache and removes it after the proxy export
+is written.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Module')]
@@ -69,6 +70,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$script:GoProxyVersionListCache = @{}
+$script:GoProxyLatestCache = @{}
+$script:GoProxyModDirectiveCache = @{}
+$script:CompatibleVersionCache = @{}
+$script:UsingDefaultGoProxyDirectory = $false
+
+if ($PSCmdlet.ParameterSetName -eq 'ModuleList' -and -not $GoProxyDirectory) {
+    $GoProxyDirectory = Join-Path (Get-Location) 'go-proxy-cache'
+    $script:UsingDefaultGoProxyDirectory = $true
+}
+
 $script:UsingTemporaryOutputDirectory = $false
 if (-not $OutputDirectory) {
     if ($PSCmdlet.ParameterSetName -in @('Module', 'ModuleList') -and $GoProxyDirectory -and -not $Expand) {
@@ -85,6 +97,11 @@ function New-Directory {
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path | Out-Null
     }
+}
+
+function Write-Status {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    [Console]::Error.WriteLine("[go-fetch] $Message")
 }
 
 function ConvertTo-SafeFileName {
@@ -944,15 +961,63 @@ function Get-GoProxyVersions {
         [Parameter(Mandatory = $true)][string]$ProxyBase
     )
 
+    $cacheKey = "$ProxyBase|$ModulePath"
+    if ($script:GoProxyVersionListCache.ContainsKey($cacheKey)) {
+        return $script:GoProxyVersionListCache[$cacheKey]
+    }
+
     $escapedModule = Escape-GoProxySegment -Value $ModulePath
     $moduleBaseUrl = Join-Url -Base $ProxyBase -Path $escapedModule
     $listUrl = Join-Url -Base (Join-Url -Base $moduleBaseUrl -Path '@v') -Path 'list'
     $response = Invoke-Http -Uri $listUrl
     $content = ConvertFrom-HttpContent -Content $response.Content
 
-    return @($content -split "`n" |
+    $versions = @($content -split "`n" |
         ForEach-Object { $_.Trim() } |
         Where-Object { $_ })
+    $script:GoProxyVersionListCache[$cacheKey] = $versions
+    return $versions
+}
+
+function Get-GoProxyLatestVersion {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModulePath,
+        [Parameter(Mandatory = $true)][string]$ProxyBase
+    )
+
+    $cacheKey = "$ProxyBase|$ModulePath"
+    if ($script:GoProxyLatestCache.ContainsKey($cacheKey)) {
+        return $script:GoProxyLatestCache[$cacheKey]
+    }
+
+    $escapedModule = Escape-GoProxySegment -Value $ModulePath
+    $moduleBaseUrl = Join-Url -Base $ProxyBase -Path $escapedModule
+    $latestUrl = Join-Url -Base $moduleBaseUrl -Path '@latest'
+    $latest = Invoke-Json -Uri $latestUrl
+    $script:GoProxyLatestCache[$cacheKey] = $latest.Version
+    return $latest.Version
+}
+
+function Get-GoProxyModDirective {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModulePath,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$ProxyBase
+    )
+
+    $cacheKey = "$ProxyBase|$ModulePath|$Version"
+    if ($script:GoProxyModDirectiveCache.ContainsKey($cacheKey)) {
+        return $script:GoProxyModDirectiveCache[$cacheKey]
+    }
+
+    $escapedModule = Escape-GoProxySegment -Value $ModulePath
+    $escapedVersion = Escape-GoProxySegment -Value $Version
+    $moduleBaseUrl = Join-Url -Base $ProxyBase -Path $escapedModule
+    $versionBase = Join-Url -Base $moduleBaseUrl -Path '@v'
+    $modResponse = Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.mod")
+    $goDirective = Get-GoDirectiveFromModContent -Content (ConvertFrom-HttpContent -Content $modResponse.Content)
+    $script:GoProxyModDirectiveCache[$cacheKey] = $goDirective
+    return $goDirective
 }
 
 function Get-GoProxyDirectoryVersions {
@@ -976,18 +1041,33 @@ function Get-GoProxyDirectoryVersions {
 function Sort-GoModuleVersionsDescending {
     param([Parameter(Mandatory = $true)][string[]]$Versions)
 
-    $sortedVersions = @($Versions)
-    for ($index = 0; $index -lt $sortedVersions.Count; $index++) {
-        for ($inner = $index + 1; $inner -lt $sortedVersions.Count; $inner++) {
-            if ((Compare-GoModuleVersion -Left $sortedVersions[$inner] -Right $sortedVersions[$index]) -gt 0) {
-                $tmp = $sortedVersions[$index]
-                $sortedVersions[$index] = $sortedVersions[$inner]
-                $sortedVersions[$inner] = $tmp
+    return @($Versions |
+        ForEach-Object {
+            $version = $_
+            $match = [regex]::Match($version, '^v(\d+)\.(\d+)\.(\d+)(-.+)?(?:\+.*)?$')
+            if ($match.Success) {
+                [pscustomobject]@{
+                    Version    = $version
+                    Major      = [int]$match.Groups[1].Value
+                    Minor      = [int]$match.Groups[2].Value
+                    Patch      = [int]$match.Groups[3].Value
+                    IsStable   = if ($match.Groups[4].Value) { 0 } else { 1 }
+                    PreRelease = $match.Groups[4].Value
+                }
             }
-        }
-    }
-
-    return $sortedVersions
+            else {
+                [pscustomobject]@{
+                    Version    = $version
+                    Major      = -1
+                    Minor      = -1
+                    Patch      = -1
+                    IsStable   = 0
+                    PreRelease = $version
+                }
+            }
+        } |
+        Sort-Object -Property Major, Minor, Patch, IsStable, PreRelease -Descending |
+        Select-Object -ExpandProperty Version)
 }
 
 function Resolve-LatestCompatibleFromGoProxyDirectory {
@@ -1028,8 +1108,18 @@ function Resolve-LatestCompatibleModuleVersion {
         [Parameter(Mandatory = $true)][version]$TargetGoVersion
     )
 
+    $compatibilityCacheKey = "$TargetGoVersion|$PackagePath|$ModulePath"
+    if ($script:CompatibleVersionCache.ContainsKey($compatibilityCacheKey)) {
+        $cached = $script:CompatibleVersionCache[$compatibilityCacheKey]
+        Write-Status "resolved $PackagePath from in-run compatibility cache as $($cached.ModulePath)@$($cached.Version)"
+        return $cached
+    }
+
+    Write-Status "resolving latest $PackagePath compatible with Go $TargetGoVersion"
     $cachedCompatibility = Resolve-LatestCompatibleFromGoProxyDirectory -PackagePath $PackagePath -ModulePath $ModulePath -TargetGoVersion $TargetGoVersion
     if ($cachedCompatibility) {
+        $script:CompatibleVersionCache[$compatibilityCacheKey] = $cachedCompatibility
+        Write-Status "resolved $PackagePath from static proxy cache as $($cachedCompatibility.ModulePath)@$($cachedCompatibility.Version) (go $($cachedCompatibility.GoDirective))"
         return $cachedCompatibility
     }
 
@@ -1043,29 +1133,57 @@ function Resolve-LatestCompatibleModuleVersion {
         }
 
         try {
-            $versions = @(Get-GoProxyVersions -ModulePath $ModulePath -ProxyBase $proxyBase)
             $candidateChecks = @()
-            $sortedVersions = @(Sort-GoModuleVersionsDescending -Versions $versions)
+            $latestVersion = ''
 
-            $escapedModule = Escape-GoProxySegment -Value $ModulePath
-            $moduleBaseUrl = Join-Url -Base $proxyBase -Path $escapedModule
-            $versionBase = Join-Url -Base $moduleBaseUrl -Path '@v'
+            try {
+                $latestVersion = Get-GoProxyLatestVersion -ModulePath $ModulePath -ProxyBase $proxyBase
+                Write-Status "checking $ModulePath@$latestVersion from $proxyBase for Go $TargetGoVersion compatibility"
+                $latestGoDirective = Get-GoProxyModDirective -ModulePath $ModulePath -Version $latestVersion -ProxyBase $proxyBase
+                $latestCompatible = Test-GoDirectiveCompatible -Directive $latestGoDirective -TargetVersion $TargetGoVersion
+                $candidateChecks += "${latestVersion}: go $latestGoDirective compatible=$latestCompatible"
+                if ($latestCompatible) {
+                    $resolved = [pscustomobject]@{
+                        PackagePath = $PackagePath
+                        ModulePath  = $ModulePath
+                        Version     = $latestVersion
+                        GoDirective = $latestGoDirective
+                        Proxy       = $proxyBase
+                    }
+                    $script:CompatibleVersionCache[$compatibilityCacheKey] = $resolved
+                    Write-Status "resolved $PackagePath as $ModulePath@$latestVersion from $proxyBase (go $latestGoDirective)"
+                    return $resolved
+                }
+            }
+            catch {
+                $candidateChecks += "@latest: $($_.Exception.Message)"
+                Write-Verbose "Compatibility check failed for ${ModulePath}@latest: $($_.Exception.Message)"
+            }
+
+            $versions = @(Get-GoProxyVersions -ModulePath $ModulePath -ProxyBase $proxyBase)
+            $sortedVersions = @(Sort-GoModuleVersionsDescending -Versions $versions)
+            Write-Status "scanning $($sortedVersions.Count) versions for $ModulePath from $proxyBase"
 
             foreach ($candidateVersion in $sortedVersions) {
-                $escapedVersion = Escape-GoProxySegment -Value $candidateVersion
+                if ($latestVersion -and $candidateVersion -eq $latestVersion) {
+                    continue
+                }
+
                 try {
-                    $modResponse = Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.mod")
-                    $goDirective = Get-GoDirectiveFromModContent -Content (ConvertFrom-HttpContent -Content $modResponse.Content)
+                    $goDirective = Get-GoProxyModDirective -ModulePath $ModulePath -Version $candidateVersion -ProxyBase $proxyBase
                     $compatible = Test-GoDirectiveCompatible -Directive $goDirective -TargetVersion $TargetGoVersion
                     $candidateChecks += "${candidateVersion}: go $goDirective compatible=$compatible"
                     if ($compatible) {
-                        return [pscustomobject]@{
+                        $resolved = [pscustomobject]@{
                             PackagePath = $PackagePath
                             ModulePath  = $ModulePath
                             Version     = $candidateVersion
                             GoDirective = $goDirective
                             Proxy       = $proxyBase
                         }
+                        $script:CompatibleVersionCache[$compatibilityCacheKey] = $resolved
+                        Write-Status "resolved $PackagePath as $ModulePath@$candidateVersion from $proxyBase (go $goDirective)"
+                        return $resolved
                     }
                 }
                 catch {
@@ -1125,8 +1243,8 @@ function Get-SelectedModuleVersions {
     }
 
     return [pscustomobject]@{
-        Selected   = $selected | Sort-Object -Property Module, Version
-        Superseded = $superseded | Sort-Object -Property Module, Version
+        Selected   = @($selected | Sort-Object -Property Module, Version)
+        Superseded = @($superseded | Sort-Object -Property Module, Version)
     }
 }
 
@@ -1271,6 +1389,7 @@ function Export-GoProxyArtifact {
         $versions += $RetrievalResult.Version
     }
     $versions | Sort-Object -Unique | Set-Content -LiteralPath $listFile -Encoding ASCII
+    Write-Status "exported $($RetrievalResult.Module)@$($RetrievalResult.Version) to static proxy $moduleProxyDirectory"
 
     return [pscustomobject]@{
         Exported        = $true
@@ -1300,6 +1419,7 @@ function Get-ModuleFromGoProxyDirectory {
 
     $versionDirectory = Get-GoProxyModuleVersionDirectory -Root $GoProxyDirectory -ModulePath $ModulePath
     $escapedVersion = Escape-GoProxySegment -Value $RequestedVersion
+    Write-Status "found cached $ModulePath@$RequestedVersion in static proxy $versionDirectory"
 
     return [pscustomobject]@{
         Mode         = 'ModuleProxy'
@@ -1336,6 +1456,7 @@ function Invoke-ModuleRetrieval {
         return $proxyDirectoryResult
     }
 
+    Write-Status "retrieving $ModulePath@$RequestedVersion"
     $moduleDestination = Join-Path (Join-Path $OutputDirectory 'modules') (ConvertTo-SafeFileName -Value $ModulePath)
     $errors = @()
 
@@ -1347,9 +1468,11 @@ function Invoke-ModuleRetrieval {
         try {
             $result = $null
             if ($proxyBase -eq 'direct') {
+                Write-Status "downloading $ModulePath@$RequestedVersion directly"
                 $result = Get-ModuleDirect -ModulePath $ModulePath -RequestedVersion $RequestedVersion -Destination $moduleDestination
             }
             else {
+                Write-Status "downloading $ModulePath@$RequestedVersion from $proxyBase"
                 $result = Get-ModuleFromProxy -ModulePath $ModulePath -RequestedVersion $RequestedVersion -ProxyBase $proxyBase -Destination $moduleDestination
             }
 
@@ -1361,6 +1484,7 @@ function Invoke-ModuleRetrieval {
         }
         catch {
             $errors += "${proxyBase}: $($_.Exception.Message)"
+            Write-Status "failed $ModulePath@$RequestedVersion via ${proxyBase}: $($_.Exception.Message)"
             Write-Verbose "Retrieval via $proxyBase failed for ${ModulePath}@${RequestedVersion}: $($_.Exception.Message)"
         }
     }
@@ -1380,6 +1504,7 @@ function Invoke-PackageListRetrieval {
     $failures = @()
 
     foreach ($entry in $entries) {
+        Write-Status "processing package list entry $($entry.LineNumber): $($entry.Package) -> $($entry.Module)@$($entry.Version)"
         try {
             $retrieval = if ($ResolveDependencies) {
                 Resolve-ModuleDependencyGraph -RootModule $entry.Module -RootVersion $entry.Version
@@ -1387,6 +1512,7 @@ function Invoke-PackageListRetrieval {
             else {
                 Invoke-ModuleRetrieval -ModulePath $entry.Module -RequestedVersion $entry.Version
             }
+            Write-Status "completed package list entry $($entry.LineNumber): $($entry.Package)"
 
             $results += [pscustomobject]@{
                 LineNumber              = $entry.LineNumber
@@ -1400,6 +1526,7 @@ function Invoke-PackageListRetrieval {
             }
         }
         catch {
+            Write-Status "failed package list entry $($entry.LineNumber): $($entry.Package) - $($_.Exception.Message)"
             $failure = [pscustomobject]@{
                 LineNumber = $entry.LineNumber
                 Package    = $entry.Package
@@ -1425,11 +1552,11 @@ function Invoke-PackageListRetrieval {
         Mode         = 'ModulePackageList'
         PackageList  = (Resolve-Path -LiteralPath $Path).Path
         TargetGoVersion = if ($GoVersion) { (ConvertTo-GoVersionObject -Value $GoVersion).ToString() } else { '' }
-        Requested    = $entries
+        Requested    = @($entries)
         SuccessCount = @($results | Where-Object { $_.Success }).Count
-        FailureCount = $failures.Count
-        Results      = $results
-        Failures     = $failures
+        FailureCount = @($failures).Count
+        Results      = @($results)
+        Failures     = @($failures)
     }
 }
 
@@ -1453,6 +1580,7 @@ function Resolve-ModuleDependencyGraph {
         Version = $RootVersion
         Parent  = ''
     })
+    Write-Status "resolving dependency graph for $RootModule@$RootVersion"
 
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
@@ -1519,6 +1647,7 @@ function Resolve-ModuleDependencyGraph {
             }
         }
         catch {
+            Write-Status "dependency failed $($current.Module)@$($current.Version) from parent $($current.Parent): $($_.Exception.Message)"
             $failures += [pscustomobject]@{
                 Module  = $current.Module
                 Version = $current.Version
@@ -1529,23 +1658,24 @@ function Resolve-ModuleDependencyGraph {
     }
 
     $versionSelection = Get-SelectedModuleVersions -Retrieved $retrieved
+    Write-Status "completed dependency graph for $RootModule@${RootVersion}: retrieved=$(@($retrieved).Count), selected=$(@($versionSelection.Selected).Count), failures=$(@($failures).Count), skipped=$(@($skipped).Count)"
 
     return [pscustomobject]@{
         Mode           = 'ModuleDependencyGraph'
         RootModule     = $RootModule
         RootVersion    = $RootVersion
-        RetrievedCount = $retrieved.Count
-        SelectedCount  = $versionSelection.Selected.Count
-        SupersededCount = $versionSelection.Superseded.Count
-        FailureCount   = $failures.Count
-        SkippedCount   = $skipped.Count
-        Replacements   = $replacements
-        Exclusions     = $exclusions
-        Skipped        = $skipped
-        Selected       = $versionSelection.Selected
-        Superseded     = $versionSelection.Superseded
-        Retrieved      = $retrieved
-        Failures       = $failures
+        RetrievedCount = @($retrieved).Count
+        SelectedCount  = @($versionSelection.Selected).Count
+        SupersededCount = @($versionSelection.Superseded).Count
+        FailureCount   = @($failures).Count
+        SkippedCount   = @($skipped).Count
+        Replacements   = @($replacements)
+        Exclusions     = @($exclusions)
+        Skipped        = @($skipped)
+        Selected       = @($versionSelection.Selected)
+        Superseded     = @($versionSelection.Superseded)
+        Retrieved      = @($retrieved)
+        Failures       = @($failures)
     }
 }
 
@@ -1567,6 +1697,8 @@ function Write-ResultAndExit {
     if ($Result -is [psobject]) {
         $Result | Add-Member -NotePropertyName WorkingOutputDirectory -NotePropertyValue $OutputDirectory -Force
         $Result | Add-Member -NotePropertyName TemporaryOutputDirectory -NotePropertyValue $script:UsingTemporaryOutputDirectory -Force
+        $Result | Add-Member -NotePropertyName GoProxyDirectory -NotePropertyValue $GoProxyDirectory -Force
+        $Result | Add-Member -NotePropertyName DefaultGoProxyDirectory -NotePropertyValue $script:UsingDefaultGoProxyDirectory -Force
     }
 
     $json = $Result | ConvertTo-Json -Depth $Depth
@@ -1576,6 +1708,10 @@ function Write-ResultAndExit {
 }
 
 New-Directory -Path $OutputDirectory
+Write-Status "working output directory: $OutputDirectory"
+if ($GoProxyDirectory) {
+    Write-Status "static proxy output directory: $GoProxyDirectory"
+}
 
 if ($PSCmdlet.ParameterSetName -eq 'Module') {
     if ($ResolveDependencies) {

@@ -73,7 +73,11 @@ github.com/boumenot/gocover-cobertura v1.5.0
 Bare entries require `-GoVersion`; the script checks proxy module versions from
 newest to oldest and selects the first version whose `go` directive is
 compatible with the target version. Inputs like `1.26.5-1` are normalized to the
-Go language version `1.26.5`.
+Go language version `1.26.5`. The resolver first checks versions already present
+in `-GoProxyDirectory`, then probes the upstream proxy's `@latest` endpoint, and
+only falls back to scanning the full version list when latest is not compatible.
+Version lists and compatibility checks are cached within a run so aliases that
+share a module do not repeat the same proxy requests.
 
 Built-in short names currently include:
 
@@ -140,18 +144,44 @@ $env:GITLAB_TOKEN = "glpat-..."
 
 ## Output
 
-By default, downloads are written under:
+For package-list retrieval, output defaults to static Go proxy layout under:
 
 ```text
-.\go-library-cache
+.\go-proxy-cache
 ```
 
-For routine static Go proxy updates, prefer `-GoProxyDirectory`:
+This means the usual package-list command writes durable `.info`, `.mod`,
+`.zip`, and `list` files directly into the folder you can transfer to your
+internal static proxy:
+
+```powershell
+.\Get-GoLibrary.ps1 `
+  -PackageListPath .\go-tools.txt `
+  -GoVersion 1.26.5-1
+```
+
+Pass `-GoProxyDirectory` only when you want a different proxy-cache folder:
 
 ```powershell
 .\Get-GoLibrary.ps1 `
   -PackageListPath .\go-tools.txt `
   -GoVersion 1.26.5-1 `
+  -GoProxyDirectory .\custom-go-proxy-cache
+```
+
+For single-module retrieval without `-GoProxyDirectory`, downloads are written
+under:
+
+```text
+.\go-library-cache
+```
+
+For a single module, pass `-GoProxyDirectory` when you want static proxy output:
+
+```powershell
+.\Get-GoLibrary.ps1 `
+  -Module "github.com/gorilla/mux" `
+  -Version "v1.8.1" `
   -GoProxyDirectory .\go-proxy-cache
 ```
 
@@ -186,6 +216,13 @@ When `-ResolveDependencies` is used, the script prints a dependency graph
 summary with every retrieved module, root `replace`/`exclude` directives,
 skipped local replacements, and any failures.
 
+For routine tool seeding, leave `-ResolveDependencies` off. A package list of Go
+developer tools should usually export only the command modules needed for
+`go install package@version`. Dependency graph retrieval is intentionally much
+larger and can take a long time behind an internal proxy or inspection gateway;
+use it only when you are deliberately trying to pre-seed the full transitive
+module closure for an air-gapped install path.
+
 The dependency graph summary includes:
 
 - `RetrievedCount`: every module version downloaded.
@@ -205,6 +242,11 @@ The dependency graph summary includes:
 - one `.log` file per sampled module.
 
 The script prints a JSON summary containing the paths it wrote.
+
+Progress messages are written to stderr with a `[go-fetch]` prefix so stdout can
+remain valid JSON for automation. During package-list runs, those messages show
+when each package is resolved, retrieved, reused from the static proxy cache, and
+exported.
 
 ## Installing Tools From The Static Proxy
 
