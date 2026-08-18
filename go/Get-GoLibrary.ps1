@@ -1,6 +1,6 @@
 <# 
 .SYNOPSIS
-Retrieves Go modules or OCI artifacts without using the Go toolchain.
+Retrieves Go modules without using the Go toolchain.
 
 .DESCRIPTION
 This script emulates the retrieval part of `go get` with pure PowerShell.
@@ -9,13 +9,10 @@ It supports:
   1. Go module proxy protocol downloads (.info, .mod, .zip).
   2. Direct GitHub and GitLab repository archive downloads.
   3. Basic go-import vanity path discovery for GitHub/GitLab-backed modules.
-  4. Generic OCI Registry v2 artifact/image pulls, including Docker Hub,
-     GitLab Container Registry, and Iron Bank-style private registries.
 
 It intentionally does not compile, install, or resolve the full Go module
-graph. Passing -Module selects Go module retrieval; passing -Registry and
--Repository selects OCI artifact/image retrieval. Passing -PackageListPath
-selects Go module retrieval for every module/version pair in a text file.
+graph. Passing -Module selects single Go module retrieval. Passing
+-PackageListPath selects Go module retrieval for every module/version pair in a text file.
 Passing -GoProxyDirectory also writes retrieved proxy modules in static Go
 proxy protocol layout for transfer to an internal proxy host. When
 -GoProxyDirectory is used without -OutputDirectory or -Expand, the script uses
@@ -48,33 +45,12 @@ param(
     [Parameter(ParameterSetName = 'ModuleList')]
     [string]$GitLabProjectPath = '',
 
-    [Parameter(ParameterSetName = 'Oci', Mandatory = $true)]
-    [string]$Registry,
-
-    [Parameter(ParameterSetName = 'Oci', Mandatory = $true)]
-    [string]$Repository,
-
-    [Parameter(ParameterSetName = 'Oci')]
-    [string]$Reference = 'latest',
-
-    [Parameter(ParameterSetName = 'Oci')]
-    [string]$Platform = 'linux/amd64',
-
     [Parameter()]
     [string]$OutputDirectory = '',
 
     [Parameter(ParameterSetName = 'Module')]
     [Parameter(ParameterSetName = 'ModuleList')]
     [string]$GoProxyDirectory = '',
-
-    [Parameter()]
-    [string]$Username = $env:REGISTRY_USERNAME,
-
-    [Parameter()]
-    [string]$Password = $env:REGISTRY_PASSWORD,
-
-    [Parameter()]
-    [string]$BearerToken = $env:REGISTRY_BEARER_TOKEN,
 
     [Parameter()]
     [string]$GitLabToken = $env:GITLAB_TOKEN,
@@ -1368,203 +1344,6 @@ function Resolve-ModuleDependencyGraph {
     }
 }
 
-function Parse-WwwAuthenticate {
-    param([Parameter(Mandatory = $true)][string]$Header)
-
-    $challenge = @{}
-    if ($Header -notmatch '^Bearer\s+(.*)$') {
-        return $challenge
-    }
-
-    $pairs = $Matches[1]
-    foreach ($match in [regex]::Matches($pairs, '(\w+)="([^"]*)"')) {
-        $challenge[$match.Groups[1].Value] = $match.Groups[2].Value
-    }
-    return $challenge
-}
-
-function Get-BasicAuthHeader {
-    if (-not $Username -or -not $Password) {
-        return ''
-    }
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes("${Username}:${Password}")
-    return 'Basic ' + [System.Convert]::ToBase64String($bytes)
-}
-
-function Get-RegistryAuthHeader {
-    param(
-        [Parameter(Mandatory = $true)][string]$RegistryHost,
-        [Parameter(Mandatory = $true)][string]$Repo,
-        [Parameter(Mandatory = $true)][string]$Action
-    )
-
-    if ($BearerToken) {
-        return @{ Authorization = "Bearer $BearerToken" }
-    }
-
-    $pingUri = "https://$RegistryHost/v2/"
-    try {
-        Invoke-Http -Uri $pingUri | Out-Null
-        return @{}
-    }
-    catch {
-        $request = [System.Net.WebRequest]::Create($pingUri)
-        $request.Method = 'GET'
-        try {
-            $request.GetResponse().Close()
-            return @{}
-        }
-        catch [System.Net.WebException] {
-            $response = $_.Exception.Response
-            if (-not $response) {
-                throw
-            }
-
-            $authHeader = $response.Headers['WWW-Authenticate']
-            if (-not $authHeader) {
-                throw "Registry requires authentication but did not send WWW-Authenticate."
-            }
-
-            $challenge = Parse-WwwAuthenticate -Header $authHeader
-            if (-not $challenge.ContainsKey('realm')) {
-                throw "Only Bearer-token registry authentication is supported by this script."
-            }
-
-            $scope = if ($challenge.ContainsKey('scope')) { $challenge['scope'] } else { "repository:${Repo}:${Action}" }
-            $tokenQuery = '?scope=' + [System.Uri]::EscapeDataString($scope)
-            if ($challenge.ContainsKey('service')) {
-                $tokenQuery = '?service=' + [System.Uri]::EscapeDataString($challenge['service']) + '&scope=' + [System.Uri]::EscapeDataString($scope)
-            }
-            $tokenUri = $challenge['realm'] + $tokenQuery
-            $headers = @{}
-            $basic = Get-BasicAuthHeader
-            if ($basic) {
-                $headers.Authorization = $basic
-            }
-
-            $tokenResponse = Invoke-Json -Uri $tokenUri -Headers $headers
-            $token = if ($tokenResponse.token) { $tokenResponse.token } else { $tokenResponse.access_token }
-            if (-not $token) {
-                throw "Registry token endpoint did not return a token."
-            }
-            return @{ Authorization = "Bearer $token" }
-        }
-    }
-}
-
-function Invoke-RegistryJson {
-    param(
-        [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][hashtable]$Headers
-    )
-
-    $response = Invoke-Http -Uri $Uri -Headers $Headers
-    return (ConvertFrom-HttpContent -Content $response.Content) | ConvertFrom-Json
-}
-
-function Get-RegistryBlob {
-    param(
-        [Parameter(Mandatory = $true)][string]$RegistryHost,
-        [Parameter(Mandatory = $true)][string]$Repo,
-        [Parameter(Mandatory = $true)][string]$Digest,
-        [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][hashtable]$Headers
-    )
-
-    $safeDigest = ConvertTo-SafeFileName -Value $Digest
-    $outFile = Join-Path $Destination $safeDigest
-    if (Test-Path -LiteralPath $outFile) {
-        return $outFile
-    }
-
-    $uri = "https://$RegistryHost/v2/$Repo/blobs/$Digest"
-    Invoke-Http -Uri $uri -Headers $Headers -OutFile $outFile | Out-Null
-    return $outFile
-}
-
-function Select-OciManifest {
-    param(
-        [Parameter(Mandatory = $true)]$Index,
-        [Parameter(Mandatory = $true)][string]$RequestedPlatform
-    )
-
-    $parts = $RequestedPlatform.Split('/')
-    $os = $parts[0]
-    $architecture = if ($parts.Count -gt 1) { $parts[1] } else { '' }
-
-    foreach ($manifest in $Index.manifests) {
-        if (-not $manifest.platform) {
-            continue
-        }
-        if ($manifest.platform.os -eq $os -and $manifest.platform.architecture -eq $architecture) {
-            return $manifest.digest
-        }
-    }
-
-    if ($Index.manifests.Count -gt 0) {
-        return $Index.manifests[0].digest
-    }
-
-    throw "OCI index did not contain any manifests."
-}
-
-function Get-OciArtifact {
-    param(
-        [Parameter(Mandatory = $true)][string]$RegistryHost,
-        [Parameter(Mandatory = $true)][string]$Repo,
-        [Parameter(Mandatory = $true)][string]$Ref,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-
-    if ($RegistryHost -eq 'docker.io') {
-        $RegistryHost = 'registry-1.docker.io'
-    }
-
-    if ($RegistryHost -eq 'registry-1.docker.io' -and $Repo.Split('/').Count -eq 1) {
-        $Repo = "library/$Repo"
-    }
-
-    New-Directory -Path $Destination
-    $headers = Get-RegistryAuthHeader -RegistryHost $RegistryHost -Repo $Repo -Action 'pull'
-    $headers.Accept = 'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
-
-    $manifestUri = "https://$RegistryHost/v2/$Repo/manifests/$Ref"
-    $manifest = Invoke-RegistryJson -Uri $manifestUri -Headers $headers
-
-    if ($manifest.mediaType -in @('application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json')) {
-        $digest = Select-OciManifest -Index $manifest -RequestedPlatform $Platform
-        $manifestUri = "https://$RegistryHost/v2/$Repo/manifests/$digest"
-        $manifest = Invoke-RegistryJson -Uri $manifestUri -Headers $headers
-        $Ref = $digest
-    }
-
-    $manifestFile = Join-Path $Destination 'manifest.json'
-    $manifest | ConvertTo-Json -Depth 100 | Set-Content -Path $manifestFile -Encoding UTF8
-
-    $configFile = $null
-    if ($manifest.config -and $manifest.config.digest) {
-        $configFile = Get-RegistryBlob -RegistryHost $RegistryHost -Repo $Repo -Digest $manifest.config.digest -Destination $Destination -Headers $headers
-    }
-
-    $layerFiles = @()
-    foreach ($layer in $manifest.layers) {
-        $layerFiles += Get-RegistryBlob -RegistryHost $RegistryHost -Repo $Repo -Digest $layer.digest -Destination $Destination -Headers $headers
-    }
-
-    return [pscustomobject]@{
-        Mode         = 'OciRegistry'
-        Registry     = $RegistryHost
-        Repository   = $Repo
-        Reference    = $Ref
-        Platform     = $Platform
-        ManifestFile = $manifestFile
-        ConfigFile   = $configFile
-        LayerFiles   = $layerFiles
-        OutputPath   = $Destination
-    }
-}
-
 function Remove-TemporaryOutputDirectory {
     if ($script:UsingTemporaryOutputDirectory -and
         $OutputDirectory -and
@@ -1608,7 +1387,3 @@ if ($PSCmdlet.ParameterSetName -eq 'ModuleList') {
     }
     Write-ResultAndExit -Result $packageListResult -Depth 40
 }
-
-$ociDestination = Join-Path (Join-Path $OutputDirectory 'oci') (Join-Path (ConvertTo-SafeFileName -Value $Registry) (ConvertTo-SafeFileName -Value "$Repository-$Reference"))
-$ociResult = Get-OciArtifact -RegistryHost $Registry -Repo $Repository -Ref $Reference -Destination $ociDestination
-Write-ResultAndExit -Result $ociResult -Depth 20
