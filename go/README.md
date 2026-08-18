@@ -53,6 +53,35 @@ Retrieve a module and every dependency listed in the downloaded `go.mod` files:
   -Expand
 ```
 
+Retrieve a saved list of packages, resolve the latest versions compatible with
+a target Go version, and export them in static Go proxy layout:
+
+```powershell
+.\Get-GoLibrary.ps1 `
+  -PackageListPath .\go-tools.txt `
+  -GoVersion 1.26.5-1 `
+  -Proxy @("https://proxy.golang.org") `
+  -GoProxyDirectory .\go-proxy-cache
+```
+
+`go-tools.txt` can contain bare package names, full package paths, or pinned
+versions:
+
+```text
+gopls
+golangci-lint
+golang.org/x/tools/gopls@v0.23.0
+github.com/boumenot/gocover-cobertura v1.5.0
+```
+
+Bare entries require `-GoVersion`; the script checks proxy module versions from
+newest to oldest and selects the first version whose `go` directive is
+compatible with the target version. Inputs like `1.26.5-1` are normalized to the
+Go language version `1.26.5`.
+
+Built-in short names currently include `gopls`, `godoc`,
+`gocover-cobertura`, and `golangci-lint`. Full package paths are also accepted.
+
 Run a random 10-module retrieval test. Dependency resolution is enabled by
 default for this test workflow:
 
@@ -139,6 +168,29 @@ By default, downloads are written under:
 
 ```text
 .\go-library-cache
+```
+
+For routine static Go proxy updates, prefer `-GoProxyDirectory`:
+
+```powershell
+.\Get-GoLibrary.ps1 `
+  -PackageListPath .\go-tools.txt `
+  -GoVersion 1.26.5-1 `
+  -GoProxyDirectory .\go-proxy-cache
+```
+
+When `-GoProxyDirectory` is used without `-OutputDirectory` or `-Expand`, the
+script uses a temporary working cache and removes it after writing the proxy
+tree. Use `-OutputDirectory` when you want to keep the download cache for
+debugging, auditing, or expanded source inspection.
+
+```powershell
+.\Get-GoLibrary.ps1 `
+  -PackageListPath .\go-tools.txt `
+  -GoVersion 1.26.5-1 `
+  -GoProxyDirectory .\go-proxy-cache `
+  -OutputDirectory .\go-library-cache `
+  -Expand
 ```
 
 Module proxy downloads save:
