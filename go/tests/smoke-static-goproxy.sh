@@ -134,6 +134,34 @@ if requested["CompatibleGoDirective"] != "1.26":
     raise SystemExit(f"expected go directive 1.26, got {requested['CompatibleGoDirective']}")
 PY
 
+cached_result="$tmp_dir/cached-result.json"
+pwsh -NoLogo -NoProfile -File "$repo_root/Get-GoLibrary.ps1" \
+  -PackageListPath "$package_list" \
+  -GoVersion 1.26.5-1 \
+  -Proxy off \
+  -GoProxyDirectory "$export_dir" >"$cached_result"
+
+python3 - "$cached_result" <<'PY'
+import json
+import pathlib
+import sys
+
+result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+requested_items = result["Requested"]
+requested = requested_items if isinstance(requested_items, dict) else requested_items[0]
+results_items = result["Results"]
+entry_result = results_items if isinstance(results_items, dict) else results_items[0]
+
+if requested["Version"] != "v0.0.1":
+    raise SystemExit(f"expected cached compatible version v0.0.1, got {requested['Version']}")
+
+if entry_result["Result"]["Proxy"] != "GoProxyDirectory":
+    raise SystemExit(f"expected retrieval from GoProxyDirectory, got {entry_result['Result']['Proxy']}")
+
+if not entry_result["Result"]["UsedProxyCache"]:
+    raise SystemExit("expected UsedProxyCache=true")
+PY
+
 "$repo_root/scripts/install-static-goproxy-cache.sh" --no-sudo "$export_dir" "$tmp_dir/static-goproxy" >/dev/null
 
 export_port_file="$tmp_dir/export.port"

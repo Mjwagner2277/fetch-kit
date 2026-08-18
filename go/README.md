@@ -160,6 +160,12 @@ script uses a temporary working cache and removes it after writing the proxy
 tree. Use `-OutputDirectory` when you want to keep the download cache for
 debugging, auditing, or expanded source inspection.
 
+The script checks `-GoProxyDirectory` before downloading. If the requested
+module version already has complete `.info`, `.mod`, `.zip`, and `list` entries
+there, it reuses those files and skips upstream proxy calls. Bare package entries
+with `-GoVersion` also check existing proxy-directory versions before asking an
+upstream proxy for `@v/list`.
+
 ```powershell
 .\Get-GoLibrary.ps1 `
   -PackageListPath .\go-tools.txt `

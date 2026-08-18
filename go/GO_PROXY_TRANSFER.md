@@ -37,6 +37,11 @@ In this mode, `-GoProxyDirectory` is the artifact you transfer. Because
 `-OutputDirectory` is not provided and `-Expand` is not used, the script uses a
 temporary working cache and removes it after the proxy tree is written.
 
+The script checks `-GoProxyDirectory` before downloading. If a complete module
+version already exists there, it reuses the existing `.info`, `.mod`, `.zip`, and
+`list` files. Bare entries resolved with `-GoVersion` also prefer compatible
+versions already present in the proxy directory before calling an upstream proxy.
+
 For dependency closure from each root package, add:
 
 ```powershell

@@ -113,6 +113,36 @@ function ConvertTo-GoProxyRelativePath {
     return (Escape-GoProxySegment -Value $ModulePath).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
 }
 
+function Get-GoProxyModuleVersionDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ModulePath
+    )
+
+    return Join-Path (Join-Path $Root (ConvertTo-GoProxyRelativePath -ModulePath $ModulePath)) '@v'
+}
+
+function Test-GoProxyVersionComplete {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$ModulePath,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
+
+    $versionDirectory = Get-GoProxyModuleVersionDirectory -Root $Root -ModulePath $ModulePath
+    $escapedVersion = Escape-GoProxySegment -Value $Version
+    $listFile = Join-Path $versionDirectory 'list'
+
+    if (-not (Test-Path -LiteralPath (Join-Path $versionDirectory "$escapedVersion.info")) -or
+        -not (Test-Path -LiteralPath (Join-Path $versionDirectory "$escapedVersion.mod")) -or
+        -not (Test-Path -LiteralPath (Join-Path $versionDirectory "$escapedVersion.zip")) -or
+        -not (Test-Path -LiteralPath $listFile)) {
+        return $false
+    }
+
+    return (@(Get-Content -LiteralPath $listFile | Where-Object { $_ }) -contains $Version)
+}
+
 function Join-Url {
     param(
         [Parameter(Mandatory = $true)][string]$Base,
@@ -237,9 +267,17 @@ function Get-ModuleFromProxy {
     $modFile = Join-Path $Destination "$escapedVersion.mod"
     $zipFile = Join-Path $Destination "$escapedVersion.zip"
 
-    Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.info") -OutFile $infoFile | Out-Null
-    Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.mod") -OutFile $modFile | Out-Null
-    Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.zip") -OutFile $zipFile | Out-Null
+    $usedWorkingCache = $false
+    if ((Test-Path -LiteralPath $infoFile) -and
+        (Test-Path -LiteralPath $modFile) -and
+        (Test-Path -LiteralPath $zipFile)) {
+        $usedWorkingCache = $true
+    }
+    else {
+        Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.info") -OutFile $infoFile | Out-Null
+        Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.mod") -OutFile $modFile | Out-Null
+        Invoke-Http -Uri (Join-Url -Base $versionBase -Path "$escapedVersion.zip") -OutFile $zipFile | Out-Null
+    }
 
     if ($Expand) {
         $expandedPath = Join-Path $Destination $escapedVersion
@@ -255,6 +293,7 @@ function Get-ModuleFromProxy {
         InfoFile    = $infoFile
         ModFile     = $modFile
         ZipFile     = $zipFile
+        UsedWorkingCache = $usedWorkingCache
         ExpandedTo  = if ($Expand) { Join-Path $Destination $escapedVersion } else { $null }
     }
 }
@@ -916,12 +955,83 @@ function Get-GoProxyVersions {
         Where-Object { $_ })
 }
 
+function Get-GoProxyDirectoryVersions {
+    param([Parameter(Mandatory = $true)][string]$ModulePath)
+
+    if (-not $GoProxyDirectory) {
+        return @()
+    }
+
+    $versionDirectory = Get-GoProxyModuleVersionDirectory -Root $GoProxyDirectory -ModulePath $ModulePath
+    $listFile = Join-Path $versionDirectory 'list'
+    if (-not (Test-Path -LiteralPath $listFile)) {
+        return @()
+    }
+
+    return @(Get-Content -LiteralPath $listFile |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and (Test-GoProxyVersionComplete -Root $GoProxyDirectory -ModulePath $ModulePath -Version $_) })
+}
+
+function Sort-GoModuleVersionsDescending {
+    param([Parameter(Mandatory = $true)][string[]]$Versions)
+
+    $sortedVersions = @($Versions)
+    for ($index = 0; $index -lt $sortedVersions.Count; $index++) {
+        for ($inner = $index + 1; $inner -lt $sortedVersions.Count; $inner++) {
+            if ((Compare-GoModuleVersion -Left $sortedVersions[$inner] -Right $sortedVersions[$index]) -gt 0) {
+                $tmp = $sortedVersions[$index]
+                $sortedVersions[$index] = $sortedVersions[$inner]
+                $sortedVersions[$inner] = $tmp
+            }
+        }
+    }
+
+    return $sortedVersions
+}
+
+function Resolve-LatestCompatibleFromGoProxyDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [Parameter(Mandatory = $true)][string]$ModulePath,
+        [Parameter(Mandatory = $true)][version]$TargetGoVersion
+    )
+
+    $versions = @(Get-GoProxyDirectoryVersions -ModulePath $ModulePath)
+    if ($versions.Count -eq 0) {
+        return $null
+    }
+
+    $versionDirectory = Get-GoProxyModuleVersionDirectory -Root $GoProxyDirectory -ModulePath $ModulePath
+    foreach ($candidateVersion in (Sort-GoModuleVersionsDescending -Versions $versions)) {
+        $escapedVersion = Escape-GoProxySegment -Value $candidateVersion
+        $modFile = Join-Path $versionDirectory "$escapedVersion.mod"
+        $goDirective = Get-GoDirectiveFromModContent -Content (Get-Content -LiteralPath $modFile -Raw)
+        if (Test-GoDirectiveCompatible -Directive $goDirective -TargetVersion $TargetGoVersion) {
+            return [pscustomobject]@{
+                PackagePath = $PackagePath
+                ModulePath  = $ModulePath
+                Version     = $candidateVersion
+                GoDirective = $goDirective
+                Proxy       = 'GoProxyDirectory'
+            }
+        }
+    }
+
+    return $null
+}
+
 function Resolve-LatestCompatibleModuleVersion {
     param(
         [Parameter(Mandatory = $true)][string]$PackagePath,
         [Parameter(Mandatory = $true)][string]$ModulePath,
         [Parameter(Mandatory = $true)][version]$TargetGoVersion
     )
+
+    $cachedCompatibility = Resolve-LatestCompatibleFromGoProxyDirectory -PackagePath $PackagePath -ModulePath $ModulePath -TargetGoVersion $TargetGoVersion
+    if ($cachedCompatibility) {
+        return $cachedCompatibility
+    }
 
     $errors = @()
     foreach ($proxyBase in Get-DefaultGoProxies) {
@@ -935,16 +1045,7 @@ function Resolve-LatestCompatibleModuleVersion {
         try {
             $versions = @(Get-GoProxyVersions -ModulePath $ModulePath -ProxyBase $proxyBase)
             $candidateChecks = @()
-            $sortedVersions = @($versions)
-            for ($index = 0; $index -lt $sortedVersions.Count; $index++) {
-                for ($inner = $index + 1; $inner -lt $sortedVersions.Count; $inner++) {
-                    if ((Compare-GoModuleVersion -Left $sortedVersions[$inner] -Right $sortedVersions[$index]) -gt 0) {
-                        $tmp = $sortedVersions[$index]
-                        $sortedVersions[$index] = $sortedVersions[$inner]
-                        $sortedVersions[$inner] = $tmp
-                    }
-                }
-            }
+            $sortedVersions = @(Sort-GoModuleVersionsDescending -Versions $versions)
 
             $escapedModule = Escape-GoProxySegment -Value $ModulePath
             $moduleBaseUrl = Join-Url -Base $proxyBase -Path $escapedModule
@@ -1144,7 +1245,7 @@ function Export-GoProxyArtifact {
 
     foreach ($path in @($RetrievalResult.InfoFile, $RetrievalResult.ModFile, $RetrievalResult.ZipFile)) {
         if (-not $path -or -not (Test-Path -LiteralPath $path)) {
-            throw "Cannot export $($RetrievalResult.Module)@$($RetrievalResult.Version): missing proxy artifact $path"
+            throw "Cannot export $($RetrievalResult.Module)@$($RetrievalResult.Version): missing proxy file $path"
         }
     }
 
@@ -1183,11 +1284,57 @@ function Export-GoProxyArtifact {
     }
 }
 
+function Get-ModuleFromGoProxyDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModulePath,
+        [Parameter(Mandatory = $true)][string]$RequestedVersion
+    )
+
+    if (-not $GoProxyDirectory -or $RequestedVersion -eq 'latest') {
+        return $null
+    }
+
+    if (-not (Test-GoProxyVersionComplete -Root $GoProxyDirectory -ModulePath $ModulePath -Version $RequestedVersion)) {
+        return $null
+    }
+
+    $versionDirectory = Get-GoProxyModuleVersionDirectory -Root $GoProxyDirectory -ModulePath $ModulePath
+    $escapedVersion = Escape-GoProxySegment -Value $RequestedVersion
+
+    return [pscustomobject]@{
+        Mode         = 'ModuleProxy'
+        Module       = $ModulePath
+        Version      = $RequestedVersion
+        Proxy        = 'GoProxyDirectory'
+        InfoFile     = Join-Path $versionDirectory "$escapedVersion.info"
+        ModFile      = Join-Path $versionDirectory "$escapedVersion.mod"
+        ZipFile      = Join-Path $versionDirectory "$escapedVersion.zip"
+        UsedProxyCache = $true
+        ExpandedTo   = $null
+        GoProxyExport = [pscustomobject]@{
+            Exported        = $true
+            Reused          = $true
+            Module          = $ModulePath
+            Version         = $RequestedVersion
+            ModuleDirectory = $versionDirectory
+            ListFile        = Join-Path $versionDirectory 'list'
+            InfoFile        = Join-Path $versionDirectory "$escapedVersion.info"
+            ModFile         = Join-Path $versionDirectory "$escapedVersion.mod"
+            ZipFile         = Join-Path $versionDirectory "$escapedVersion.zip"
+        }
+    }
+}
+
 function Invoke-ModuleRetrieval {
     param(
         [Parameter(Mandatory = $true)][string]$ModulePath,
         [Parameter(Mandatory = $true)][string]$RequestedVersion
     )
+
+    $proxyDirectoryResult = Get-ModuleFromGoProxyDirectory -ModulePath $ModulePath -RequestedVersion $RequestedVersion
+    if ($proxyDirectoryResult) {
+        return $proxyDirectoryResult
+    }
 
     $moduleDestination = Join-Path (Join-Path $OutputDirectory 'modules') (ConvertTo-SafeFileName -Value $ModulePath)
     $errors = @()
