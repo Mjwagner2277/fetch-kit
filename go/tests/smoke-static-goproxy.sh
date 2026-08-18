@@ -55,6 +55,10 @@ for version, go_version in (("v0.0.1", "1.26"), ("v0.0.2", "1.27")):
     with zipfile.ZipFile(version_dir / f"{version}.zip", "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(f"{module_root}/go.mod", f"module example.com/smoke\n\ngo {go_version}\n")
         archive.writestr(f"{module_root}/smoke.go", "package smoke\n\nfunc Message() string { return \"ok\" }\n")
+        archive.writestr(
+            f"{module_root}/cmd/smoke-tool/main.go",
+            'package main\n\nimport "fmt"\n\nfunc main() { fmt.Println("smoke-tool ok") }\n',
+        )
 PY
 
 cat > "$tmp_dir/serve.py" <<'PY'
@@ -152,7 +156,20 @@ export_pid="$started_server_pid"
   GOPROXY="http://127.0.0.1:$export_port" \
   GOSUMDB=off \
   go mod download example.com/smoke@v0.0.1
+
+  GOBIN="$tmp_dir/bin" \
+  GOPATH="$tmp_dir/gopath" \
+  GOMODCACHE="$tmp_dir/gomodcache" \
+  GOCACHE="$tmp_dir/gocache" \
+  GOPROXY="http://127.0.0.1:$export_port" \
+  GOSUMDB=off \
+  go install example.com/smoke/cmd/smoke-tool@v0.0.1
 )
+
+if [[ "$("$tmp_dir/bin/smoke-tool")" != "smoke-tool ok" ]]; then
+  echo "go install smoke binary did not run correctly" >&2
+  exit 1
+fi
 
 test -f "$tmp_dir/static-goproxy/example.com/smoke/@v/list"
 test -f "$tmp_dir/static-goproxy/example.com/smoke/@v/v0.0.1.info"

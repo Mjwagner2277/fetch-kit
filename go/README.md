@@ -60,7 +60,12 @@ versions:
 
 ```text
 gopls
+goimports
+gofumpt
 golangci-lint
+staticcheck
+govulncheck
+gotestsum
 golang.org/x/tools/gopls@v0.23.0
 github.com/boumenot/gocover-cobertura v1.5.0
 ```
@@ -70,8 +75,31 @@ newest to oldest and selects the first version whose `go` directive is
 compatible with the target version. Inputs like `1.26.5-1` are normalized to the
 Go language version `1.26.5`.
 
-Built-in short names currently include `gopls`, `godoc`,
-`gocover-cobertura`, and `golangci-lint`. Full package paths are also accepted.
+Built-in short names currently include:
+
+- `air`
+- `dlv`
+- `gocover-cobertura`
+- `godoc`
+- `gofumpt`
+- `goimports`
+- `golangci-lint`
+- `gopls`
+- `gosec`
+- `gotestsum`
+- `govulncheck`
+- `mockgen`
+- `protoc-gen-go`
+- `protoc-gen-go-grpc`
+- `staticcheck`
+- `stringer`
+
+Full package paths are also accepted. When a command package lives below its
+module root, such as `golang.org/x/tools/cmd/goimports`, the script downloads
+and exports the owning module, such as `golang.org/x/tools`, so
+`go install package@version` can resolve the command from the static proxy.
+
+See `recommended-go-tools.txt` for a starter package list.
 
 Run a random 10-module retrieval test. Dependency resolution is enabled by
 default for this test workflow:
@@ -171,6 +199,24 @@ The dependency graph summary includes:
 - one `.log` file per sampled module.
 
 The script prints a JSON summary containing the paths it wrote.
+
+## Installing Tools From The Static Proxy
+
+After transferring `go-proxy-cache` into your internal static proxy, Go clients
+can install command packages directly:
+
+```bash
+go env -w GOPROXY=https://goproxy.internal.example.com
+go env -w GOSUMDB=off
+
+go install golang.org/x/tools/gopls@v0.23.0
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+```
+
+The package path used with `go install` may be deeper than the module path stored
+in the proxy. That is expected. The Go command resolves the package to its owning
+module and then fetches that module's `.info`, `.mod`, and `.zip` files from the
+proxy.
 
 ## Authentication Notes
 

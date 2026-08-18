@@ -10,10 +10,17 @@ Create a saved package list:
 
 ```text
 gopls
-godoc
+goimports
+gofumpt
 gocover-cobertura
 golangci-lint
+staticcheck
+govulncheck
+gotestsum
 ```
+
+Or start with `recommended-go-tools.txt` and remove anything your environment
+does not need.
 
 Download the latest versions compatible with your target Go version and export
 static proxy files:
@@ -60,10 +67,22 @@ Pinned entries do not require `-GoVersion`; bare entries do.
 
 Built-in short names currently include:
 
+- `air`
+- `dlv`
 - `gopls`
 - `godoc`
+- `gofumpt`
+- `goimports`
 - `gocover-cobertura`
 - `golangci-lint`
+- `gosec`
+- `gotestsum`
+- `govulncheck`
+- `mockgen`
+- `protoc-gen-go`
+- `protoc-gen-go-grpc`
+- `staticcheck`
+- `stringer`
 
 ## Resulting Proxy Layout
 
@@ -126,4 +145,5 @@ host may not have.
 
 The test creates a fake upstream Go proxy, downloads one module with
 `Get-GoLibrary.ps1`, exports it to static proxy layout, installs that export
-into a temporary static proxy root, and verifies `go mod download` can consume it.
+into a temporary static proxy root, and verifies both `go mod download` and
+`go install package@version` can consume it.

@@ -793,10 +793,22 @@ function Test-GoDirectiveCompatible {
 
 function Get-PackageAliasMap {
     return @{
-        'gopls'             = 'golang.org/x/tools/gopls'
-        'godoc'             = 'golang.org/x/tools/cmd/godoc'
-        'gocover-cobertura' = 'github.com/boumenot/gocover-cobertura'
-        'golangci-lint'     = 'github.com/golangci/golangci-lint/v2/cmd/golangci-lint'
+        'air'                 = 'github.com/air-verse/air'
+        'dlv'                 = 'github.com/go-delve/delve/cmd/dlv'
+        'gocover-cobertura'   = 'github.com/boumenot/gocover-cobertura'
+        'godoc'               = 'golang.org/x/tools/cmd/godoc'
+        'gofumpt'             = 'mvdan.cc/gofumpt'
+        'goimports'           = 'golang.org/x/tools/cmd/goimports'
+        'golangci-lint'       = 'github.com/golangci/golangci-lint/v2/cmd/golangci-lint'
+        'gopls'               = 'golang.org/x/tools/gopls'
+        'gosec'               = 'github.com/securego/gosec/v2/cmd/gosec'
+        'gotestsum'           = 'gotest.tools/gotestsum'
+        'govulncheck'         = 'golang.org/x/vuln/cmd/govulncheck'
+        'mockgen'             = 'go.uber.org/mock/mockgen'
+        'protoc-gen-go'       = 'google.golang.org/protobuf/cmd/protoc-gen-go'
+        'protoc-gen-go-grpc'  = 'google.golang.org/grpc/cmd/protoc-gen-go-grpc'
+        'staticcheck'         = 'honnef.co/go/tools/cmd/staticcheck'
+        'stringer'            = 'golang.org/x/tools/cmd/stringer'
     }
 }
 
@@ -808,7 +820,11 @@ function Resolve-PackageModulePath {
         $PackagePath = $aliases[$PackagePath]
     }
 
-    if ($PackagePath -eq 'golang.org/x/tools/cmd/godoc') {
+    if ($PackagePath -in @(
+            'golang.org/x/tools/cmd/godoc',
+            'golang.org/x/tools/cmd/goimports',
+            'golang.org/x/tools/cmd/stringer'
+        )) {
         return [pscustomobject]@{
             PackagePath = $PackagePath
             ModulePath  = 'golang.org/x/tools'
@@ -819,6 +835,48 @@ function Resolve-PackageModulePath {
         return [pscustomobject]@{
             PackagePath = $PackagePath
             ModulePath  = 'github.com/golangci/golangci-lint/v2'
+        }
+    }
+
+    if ($PackagePath -eq 'github.com/go-delve/delve/cmd/dlv') {
+        return [pscustomobject]@{
+            PackagePath = $PackagePath
+            ModulePath  = 'github.com/go-delve/delve'
+        }
+    }
+
+    if ($PackagePath -eq 'github.com/securego/gosec/v2/cmd/gosec') {
+        return [pscustomobject]@{
+            PackagePath = $PackagePath
+            ModulePath  = 'github.com/securego/gosec/v2'
+        }
+    }
+
+    if ($PackagePath -eq 'go.uber.org/mock/mockgen') {
+        return [pscustomobject]@{
+            PackagePath = $PackagePath
+            ModulePath  = 'go.uber.org/mock'
+        }
+    }
+
+    if ($PackagePath -eq 'golang.org/x/vuln/cmd/govulncheck') {
+        return [pscustomobject]@{
+            PackagePath = $PackagePath
+            ModulePath  = 'golang.org/x/vuln'
+        }
+    }
+
+    if ($PackagePath -eq 'google.golang.org/protobuf/cmd/protoc-gen-go') {
+        return [pscustomobject]@{
+            PackagePath = $PackagePath
+            ModulePath  = 'google.golang.org/protobuf'
+        }
+    }
+
+    if ($PackagePath -eq 'honnef.co/go/tools/cmd/staticcheck') {
+        return [pscustomobject]@{
+            PackagePath = $PackagePath
+            ModulePath  = 'honnef.co/go/tools'
         }
     }
 

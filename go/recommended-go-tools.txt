@@ -1,0 +1,29 @@
+# Common Go development tools.
+# Bare names use aliases in Get-GoLibrary.ps1 and require -GoVersion.
+
+# Editor and language tooling
+gopls
+goimports
+gofumpt
+
+# Linting, security, and vulnerability checks
+golangci-lint
+staticcheck
+govulncheck
+gosec
+
+# Testing and coverage
+gotestsum
+gocover-cobertura
+
+# Debugging and code generation
+dlv
+stringer
+mockgen
+
+# Protobuf and gRPC generation, when the project uses .proto files
+protoc-gen-go
+protoc-gen-go-grpc
+
+# Optional live reload for service development
+air
