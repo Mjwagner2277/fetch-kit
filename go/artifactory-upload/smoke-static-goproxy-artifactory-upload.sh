@@ -10,7 +10,8 @@
 #
 # It verifies that authentication is sent, expected files are written, .ziphash
 # is skipped by default, file contents are preserved, and @v/list files are
-# uploaded after version artifacts.
+# uploaded after version artifacts. It also covers Go proxy escaping for module
+# paths that contain uppercase letters, such as github.com/BurntSushi/toml.
 set -Eeuo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -47,7 +48,10 @@ done
 
 mkdir -p \
   "${source_root}/example.com/mod/@v" \
-  "${source_root}/example.com/other/@v"
+  "${source_root}/example.com/other/@v" \
+  "${source_root}/github.com/BurntSushi/toml/@v" \
+  "${source_root}/github.com/Masterminds/semver/v3/@v" \
+  "${source_root}/github.com/!azure/azure-sdk-for-go/@v"
 
 printf '{"Version":"v1.0.0","Time":"2026-08-20T00:00:00Z"}\n' > "${source_root}/example.com/mod/@v/v1.0.0.info"
 printf 'module example.com/mod\n' > "${source_root}/example.com/mod/@v/v1.0.0.mod"
@@ -57,6 +61,21 @@ printf 'hash-that-should-not-upload\n' > "${source_root}/example.com/mod/@v/v1.0
 
 printf '{"Version":"v2.0.0","Time":"2026-08-20T00:00:00Z"}\n' > "${source_root}/example.com/other/@v/v2.0.0.info"
 printf 'v2.0.0\n' > "${source_root}/example.com/other/@v/list"
+
+printf '{"Version":"v1.5.0","Time":"2026-08-20T00:00:00Z"}\n' > "${source_root}/github.com/BurntSushi/toml/@v/v1.5.0.info"
+printf 'module github.com/BurntSushi/toml\n' > "${source_root}/github.com/BurntSushi/toml/@v/v1.5.0.mod"
+printf 'burntsushi-zip\n' > "${source_root}/github.com/BurntSushi/toml/@v/v1.5.0.zip"
+printf 'v1.5.0\n' > "${source_root}/github.com/BurntSushi/toml/@v/list"
+
+printf '{"Version":"v3.4.0","Time":"2026-08-20T00:00:00Z"}\n' > "${source_root}/github.com/Masterminds/semver/v3/@v/v3.4.0.info"
+printf 'module github.com/Masterminds/semver/v3\n' > "${source_root}/github.com/Masterminds/semver/v3/@v/v3.4.0.mod"
+printf 'masterminds-zip\n' > "${source_root}/github.com/Masterminds/semver/v3/@v/v3.4.0.zip"
+printf 'v3.4.0\n' > "${source_root}/github.com/Masterminds/semver/v3/@v/list"
+
+printf '{"Version":"v68.0.0","Time":"2026-08-20T00:00:00Z"}\n' > "${source_root}/github.com/!azure/azure-sdk-for-go/@v/v68.0.0.info"
+printf 'module github.com/Azure/azure-sdk-for-go\n' > "${source_root}/github.com/!azure/azure-sdk-for-go/@v/v68.0.0.mod"
+printf 'azure-zip\n' > "${source_root}/github.com/!azure/azure-sdk-for-go/@v/v68.0.0.zip"
+printf 'v68.0.0\n' > "${source_root}/github.com/!azure/azure-sdk-for-go/@v/list"
 
 python3 - "${upload_root}" "${server_ready}" "${port_file}" "${server_log}" <<'PY' &
 import http.server
@@ -139,6 +158,18 @@ expected_files=(
   "artifactory/go-local/mirrored/example.com/mod/@v/list"
   "artifactory/go-local/mirrored/example.com/other/@v/v2.0.0.info"
   "artifactory/go-local/mirrored/example.com/other/@v/list"
+  "artifactory/go-local/mirrored/github.com/!burnt!sushi/toml/@v/v1.5.0.info"
+  "artifactory/go-local/mirrored/github.com/!burnt!sushi/toml/@v/v1.5.0.mod"
+  "artifactory/go-local/mirrored/github.com/!burnt!sushi/toml/@v/v1.5.0.zip"
+  "artifactory/go-local/mirrored/github.com/!burnt!sushi/toml/@v/list"
+  "artifactory/go-local/mirrored/github.com/!masterminds/semver/v3/@v/v3.4.0.info"
+  "artifactory/go-local/mirrored/github.com/!masterminds/semver/v3/@v/v3.4.0.mod"
+  "artifactory/go-local/mirrored/github.com/!masterminds/semver/v3/@v/v3.4.0.zip"
+  "artifactory/go-local/mirrored/github.com/!masterminds/semver/v3/@v/list"
+  "artifactory/go-local/mirrored/github.com/!azure/azure-sdk-for-go/@v/v68.0.0.info"
+  "artifactory/go-local/mirrored/github.com/!azure/azure-sdk-for-go/@v/v68.0.0.mod"
+  "artifactory/go-local/mirrored/github.com/!azure/azure-sdk-for-go/@v/v68.0.0.zip"
+  "artifactory/go-local/mirrored/github.com/!azure/azure-sdk-for-go/@v/list"
 )
 
 for rel in "${expected_files[@]}"; do
@@ -153,18 +184,28 @@ done
   exit 1
 }
 
-cmp "${source_root}/example.com/mod/@v/v1.0.0.mod" \
-  "${upload_root}/artifactory/go-local/mirrored/example.com/mod/@v/v1.0.0.mod"
-
-last_two="$(tail -n 2 "$server_log")"
-expected_last_two=$'artifactory/go-local/mirrored/example.com/mod/@v/list\nartifactory/go-local/mirrored/example.com/other/@v/list'
-[[ "$last_two" == "$expected_last_two" ]] || {
-  printf 'list files were not uploaded last\n' >&2
-  printf 'last uploads:\n%s\n' "$last_two" >&2
+[[ ! -e "${upload_root}/artifactory/go-local/mirrored/github.com/BurntSushi/toml/@v/v1.5.0.mod" ]] || {
+  printf 'unescaped BurntSushi path should not have uploaded\n' >&2
   exit 1
 }
 
-grep -q 'Summary: uploaded=6 skipped=1 failed=0 considered=6' "${tmpdir}/upload.out" || {
+[[ ! -e "${upload_root}/artifactory/go-local/mirrored/github.com/Masterminds/semver/v3/@v/v3.4.0.mod" ]] || {
+  printf 'unescaped Masterminds path should not have uploaded\n' >&2
+  exit 1
+}
+
+cmp "${source_root}/example.com/mod/@v/v1.0.0.mod" \
+  "${upload_root}/artifactory/go-local/mirrored/example.com/mod/@v/v1.0.0.mod"
+
+last_five="$(tail -n 5 "$server_log")"
+expected_last_five=$'artifactory/go-local/mirrored/example.com/mod/@v/list\nartifactory/go-local/mirrored/example.com/other/@v/list\nartifactory/go-local/mirrored/github.com/!azure/azure-sdk-for-go/@v/list\nartifactory/go-local/mirrored/github.com/!burnt!sushi/toml/@v/list\nartifactory/go-local/mirrored/github.com/!masterminds/semver/v3/@v/list'
+[[ "$last_five" == "$expected_last_five" ]] || {
+  printf 'list files were not uploaded last\n' >&2
+  printf 'last uploads:\n%s\n' "$last_five" >&2
+  exit 1
+}
+
+grep -q 'Summary: uploaded=18 skipped=1 failed=0 considered=18' "${tmpdir}/upload.out" || {
   printf 'unexpected upload summary\n' >&2
   cat "${tmpdir}/upload.out" >&2
   exit 1

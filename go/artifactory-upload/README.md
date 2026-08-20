@@ -70,6 +70,55 @@ https://artifactory.example.com/artifactory/go-local/mirrored/example.com/mod/@v
 If you do not want an extra path segment in the repository, omit
 `--target-prefix`.
 
+## Uppercase Module Paths
+
+Go module proxy paths are not a plain copy of the import path when uppercase
+letters are present. The Go proxy protocol escapes each uppercase ASCII letter
+as `!` plus its lowercase form.
+
+For example:
+
+```text
+github.com/BurntSushi/toml
+```
+
+must be served as:
+
+```text
+github.com/!burnt!sushi/toml
+```
+
+and:
+
+```text
+github.com/Masterminds/semver/v3
+```
+
+must be served as:
+
+```text
+github.com/!masterminds/semver/v3
+```
+
+By default, `upload-go-proxy-to-artifactory.sh` normalizes the module path
+portion before `/@v/` during upload. This fixes proxy trees copied from
+case-preserving filesystems or nginx roots that contain unescaped directories
+such as `github.com/BurntSushi/toml/@v`.
+
+Already escaped source paths, such as `github.com/!burnt!sushi/toml/@v`, are
+left unchanged.
+
+Use `--preserve-source-paths` only when you deliberately want Artifactory paths
+to match the local filesystem exactly:
+
+```bash
+./upload-go-proxy-to-artifactory.sh \
+  --source-dir ./go-proxy-cache \
+  --artifactory-url https://artifactory.example.com/artifactory \
+  --repo go-local \
+  --preserve-source-paths
+```
+
 ## Basic Upload
 
 Use an access token through the environment:

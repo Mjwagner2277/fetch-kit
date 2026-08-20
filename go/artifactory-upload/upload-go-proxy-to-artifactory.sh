@@ -11,8 +11,8 @@
 #   example.com/module/@v/v1.2.3.mod
 #   example.com/module/@v/v1.2.3.zip
 #
-# The script preserves those relative paths and uploads each file with
-# Artifactory's artifact deployment REST API:
+# The script uploads those relative paths with Artifactory's artifact deployment
+# REST API:
 #
 #   PUT <artifactory-url>/<repo>/<optional-prefix>/<relative-go-proxy-path>
 #
@@ -20,6 +20,15 @@
 # such as .ziphash are intentionally skipped unless --all-files is provided.
 # Version list files are uploaded after version artifacts so proxy clients do
 # not discover a listed version before its .info, .mod, and .zip files exist.
+#
+# Go proxy module paths are case-escaped. For example, the module path
+# github.com/BurntSushi/toml must be served as:
+#
+#   github.com/!burnt!sushi/toml/@v/v1.5.0.mod
+#
+# To protect trees copied from case-preserving filesystems or nginx roots, the
+# uploader normalizes the module path before /@v/ by default. If your source
+# tree is already escaped, normalization is idempotent.
 set -Eeuo pipefail
 
 prog="${0##*/}"
@@ -35,6 +44,7 @@ password="${ARTIFACTORY_PASSWORD:-}"
 dry_run=0
 all_files=0
 insecure=0
+preserve_source_paths=0
 retries=3
 retry_delay=2
 
@@ -69,6 +79,8 @@ Authentication, choose one:
 Options:
   --target-prefix PATH    Optional prefix inside the Artifactory repository.
   --all-files             Upload every file. By default only Go proxy files are uploaded.
+  --preserve-source-paths Upload paths exactly as found under --source-dir.
+                          By default Go module paths before /@v/ are escaped.
   --dry-run               Print uploads without calling Artifactory.
   --insecure              Pass --insecure to curl.
   --retries N             curl retry count. Default: $retries.
@@ -159,6 +171,75 @@ is_version_list() {
   esac
 }
 
+escape_go_module_path() {
+  local value="$1"
+  local i char escaped=""
+
+  # Go's module proxy escaping maps each uppercase ASCII letter to ! plus its
+  # lowercase form. Existing escaped paths contain only lowercase plus literal
+  # ! markers, so applying this to an already escaped module path is safe.
+  for ((i = 0; i < ${#value}; i++)); do
+    char="${value:i:1}"
+    case "$char" in
+      A) escaped+="!a" ;;
+      B) escaped+="!b" ;;
+      C) escaped+="!c" ;;
+      D) escaped+="!d" ;;
+      E) escaped+="!e" ;;
+      F) escaped+="!f" ;;
+      G) escaped+="!g" ;;
+      H) escaped+="!h" ;;
+      I) escaped+="!i" ;;
+      J) escaped+="!j" ;;
+      K) escaped+="!k" ;;
+      L) escaped+="!l" ;;
+      M) escaped+="!m" ;;
+      N) escaped+="!n" ;;
+      O) escaped+="!o" ;;
+      P) escaped+="!p" ;;
+      Q) escaped+="!q" ;;
+      R) escaped+="!r" ;;
+      S) escaped+="!s" ;;
+      T) escaped+="!t" ;;
+      U) escaped+="!u" ;;
+      V) escaped+="!v" ;;
+      W) escaped+="!w" ;;
+      X) escaped+="!x" ;;
+      Y) escaped+="!y" ;;
+      Z) escaped+="!z" ;;
+      *)
+        escaped+="$char"
+        ;;
+    esac
+  done
+
+  printf '%s' "$escaped"
+}
+
+normalize_go_proxy_path() {
+  local rel="$1"
+  local module_path suffix
+
+  if [[ "$preserve_source_paths" -eq 1 ]]; then
+    printf '%s' "$rel"
+    return 0
+  fi
+
+  case "$rel" in
+    */@v/*)
+      module_path="${rel%%/@v/*}"
+      suffix="${rel#*/@v/}"
+      printf '%s/@v/%s' "$(escape_go_module_path "$module_path")" "$suffix"
+      ;;
+    @v/*)
+      printf '%s' "$rel"
+      ;;
+    *)
+      printf '%s' "$rel"
+      ;;
+  esac
+}
+
 parse_positive_int() {
   local name="$1"
   local value="$2"
@@ -210,6 +291,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all-files)
       all_files=1
+      shift
+      ;;
+    --preserve-source-paths)
+      preserve_source_paths=1
       shift
       ;;
     --dry-run)
@@ -280,7 +365,7 @@ if curl --help all 2>/dev/null | grep -q -- '--fail-with-body'; then
 fi
 
 # --path-as-is keeps Go module escape sequences and @v path components exactly
-# as they appear in the local proxy tree.
+# as they appear in the target path.
 curl_common=(-sS "$curl_fail_arg" --retry "$retries" --retry-delay "$retry_delay" --path-as-is)
 if [[ "$insecure" -eq 1 ]]; then
   curl_common+=(--insecure)
@@ -303,13 +388,18 @@ failed=0
 upload_one() {
   local file="$1"
   local rel="$2"
-  local target_path target_url http_code curl_exit
+  local normalized_rel target_path target_url http_code curl_exit
 
-  target_path="$(join_path "$target_prefix" "$rel")"
+  normalized_rel="$(normalize_go_proxy_path "$rel")"
+  target_path="$(join_path "$target_prefix" "$normalized_rel")"
   target_url="${artifactory_url}/${repo}/${target_path}"
 
   if [[ "$dry_run" -eq 1 ]]; then
-    printf 'DRY-RUN: %s -> %s\n' "$file" "$target_url"
+    if [[ "$normalized_rel" != "$rel" ]]; then
+      printf 'DRY-RUN: %s -> %s (from %s)\n' "$file" "$target_url" "$rel"
+    else
+      printf 'DRY-RUN: %s -> %s\n' "$file" "$target_url"
+    fi
     uploaded=$((uploaded + 1))
     return 0
   fi
@@ -328,7 +418,11 @@ upload_one() {
   set -e
 
   if [[ "$curl_exit" -eq 0 ]]; then
-    printf 'uploaded: %s (%s)\n' "$target_path" "$http_code"
+    if [[ "$normalized_rel" != "$rel" ]]; then
+      printf 'uploaded: %s (%s, from %s)\n' "$target_path" "$http_code" "$rel"
+    else
+      printf 'uploaded: %s (%s)\n' "$target_path" "$http_code"
+    fi
     uploaded=$((uploaded + 1))
     return 0
   fi
@@ -381,6 +475,11 @@ if [[ "$all_files" -eq 0 ]]; then
   printf 'Filter: Go proxy artifacts only\n'
 else
   printf 'Filter: all files\n'
+fi
+if [[ "$preserve_source_paths" -eq 0 ]]; then
+  printf 'Path mode: escape Go module paths before /@v/\n'
+else
+  printf 'Path mode: preserve source paths exactly\n'
 fi
 if [[ "$dry_run" -eq 1 ]]; then
   printf 'Mode: dry run\n'
