@@ -142,6 +142,16 @@ $env:GITLAB_TOKEN = "glpat-..."
   -Expand
 ```
 
+## Publishing to Artifactory
+
+After exporting a static proxy tree with `-GoProxyDirectory`, use
+[`artifactory-upload/upload-go-proxy-to-artifactory.sh`](artifactory-upload/upload-go-proxy-to-artifactory.sh)
+to publish the tree into an Artifactory repository through the REST API.
+
+See [`artifactory-upload/README.md`](artifactory-upload/README.md) for
+authentication options, upload ordering details, local testing instructions, and
+Artifactory examples.
+
 ## Output
 
 For package-list retrieval, output defaults to static Go proxy layout under:

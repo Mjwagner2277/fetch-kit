@@ -22,6 +22,8 @@ container CLIs.
 ## Go
 
 See [go/README.md](go/README.md) for examples and limitations.
+The Go area also includes an Artifactory REST uploader for publishing exported
+static Go proxy trees.
 
 ## Rust
 
