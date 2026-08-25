@@ -164,11 +164,13 @@ switches:
 Version selection supports dist-tags such as `latest`, exact versions, wildcard
 ranges, caret ranges, tilde ranges, comparator ranges like `>=1 <2`, hyphen
 ranges like `1.2.0 - 1.4.0`, and `||` alternatives. For a matching range, it
-chooses the highest matching non-prerelease and non-deprecated version by
-default.
+chooses the highest matching non-prerelease version by default. Deprecated
+versions remain eligible because npm can still resolve them in dependency
+graphs.
 
-Use `-IncludePrerelease` or `-IncludeDeprecated` when those versions must be
-eligible during selection.
+Use `-IncludePrerelease` when prerelease versions must be eligible during
+selection. `-IncludeDeprecated` is still accepted for compatibility with older
+commands, but deprecated versions are no longer filtered by default.
 
 ## Important Differences From npm
 
@@ -198,7 +200,8 @@ collecting npm registry source artifacts for offline review or mirroring.
 - `-IncludeDevDependencies`: include root package `devDependencies`.
 - `-IncludeOptionalDependencies`: include `optionalDependencies`.
 - `-IncludePeerDependencies`: include `peerDependencies`.
-- `-IncludeDeprecated`: allow deprecated versions during selection.
+- `-IncludeDeprecated`: accepted for compatibility; deprecated versions are
+  eligible by default.
 - `-IncludePrerelease`: allow prerelease versions during selection.
 - `-BearerToken`: bearer token for private registries, defaults to
   `$env:NPM_TOKEN`.
@@ -294,7 +297,8 @@ Useful optional settings:
 
 - `GITLAB_NPM_REGISTRY`: override the source npm registry URL.
 - `GITLAB_PACKAGE_STATUS`: package status filter. Defaults to `default`; set
-  `all` to omit the status filter.
+  `all` to omit the status filter. Use `all` if you are reconciling missing
+  versions and want GitLab to return every package status the API will expose.
 - `WORK_DIR`: where tarballs, logs, and summary files are written.
 - `KEEP_WORK_DIR=true`: keep the temporary work directory after completion.
 - `SKIP_EXISTING=true`: treat already-published Artifactory versions as success.
@@ -316,6 +320,53 @@ GITLAB_SCOPE_ID=my-group/subgroup \
 The script writes a JSON summary to stdout and stores `results.jsonl` plus
 `summary.json` in `WORK_DIR`. It exits non-zero if any selected package version
 fails to mirror.
+
+To verify what the script will try to mirror before publishing, keep the work
+directory and run a dry run:
+
+```bash
+KEEP_WORK_DIR=true \
+WORK_DIR=/tmp/gitlab-npm-mirror-audit \
+DRY_RUN=true \
+GITLAB_PACKAGE_STATUS=all \
+GITLAB_URL=https://gitlab.example.com \
+GITLAB_TOKEN=glpat-... \
+GITLAB_SCOPE_TYPE=project \
+GITLAB_SCOPE_ID=12345 \
+ARTIFACTORY_NPM_REGISTRY=https://art.example.com/artifactory/api/npm/npm-local/ \
+ARTIFACTORY_TOKEN=... \
+  ./npm/mirror-gitlab-npm-to-artifactory.sh
+```
+
+Then inspect:
+
+```bash
+cut -f1,2 "$WORK_DIR/gitlab-npm-packages.tsv"
+jq -r '.results[] | [.status, .package, .version] | @tsv' "$WORK_DIR/summary.json"
+```
+
+Each line in `gitlab-npm-packages.tsv` is one GitLab package version selected
+from the API. The final summary separates `mirrored`, `skipped_existing`,
+filtered `skipped`, and `failed`, so already-present Artifactory versions are no
+longer blended into the publish count.
+
+To confirm packages with multiple versions are handled separately:
+
+```bash
+column -t -s $'\t' "$WORK_DIR/gitlab-npm-version-counts.tsv"
+```
+
+Example:
+
+```text
+Package                VersionCount  Versions
+@protobuf-ts/runtime   3             2.9.3,2.9.4,2.9.5
+@protobuf-ts/plugin    2             2.9.4,2.9.5
+```
+
+The script mirrors each `name + version` row independently, so those examples
+would publish `@protobuf-ts/runtime@2.9.3`, `@protobuf-ts/runtime@2.9.4`, and
+`@protobuf-ts/runtime@2.9.5` as separate package versions.
 
 Dry-run sizing example:
 

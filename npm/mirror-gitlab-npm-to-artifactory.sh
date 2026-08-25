@@ -208,6 +208,25 @@ list_gitlab_npm_packages() {
   sort -u "$output_file" -o "$output_file"
 }
 
+write_version_inventory() {
+  local package_list="$1"
+  local output_file="$2"
+
+  {
+    printf 'Package\tVersionCount\tVersions\n'
+    awk -F '\t' '
+      {
+        counts[$1]++;
+        versions[$1] = versions[$1] ? versions[$1] "," $2 : $2;
+      }
+      END {
+        for (name in counts) {
+          print name "\t" counts[name] "\t" versions[name];
+        }
+      }' "$package_list" | sort
+  } >"$output_file"
+}
+
 get_package_files_url() {
   local package_id="$1"
   local project_id="${2:-}"
@@ -295,6 +314,7 @@ publish_to_artifactory() {
   local tarball="$1"
   local package_ref="$2"
   local publish_log="${WORK_DIR}/publish.log"
+  PUBLISH_RESULT="published"
 
   log "Publishing ${package_ref} to Artifactory"
   set +e
@@ -307,14 +327,17 @@ publish_to_artifactory() {
   set -e
 
   if [[ "$exit_code" -eq 0 ]]; then
+    PUBLISH_RESULT="published"
     return 0
   fi
 
   if is_true "${SKIP_EXISTING:-true}" && grep -Eiq 'EPUBLISHCONFLICT|already exists|already present|cannot publish over|409|conflict' "$publish_log"; then
     log "Skipping existing package ${package_ref}"
+    PUBLISH_RESULT="skipped-existing"
     return 0
   fi
 
+  PUBLISH_RESULT="failed"
   sed 's/^/[npm publish] /' "$publish_log" >&2
   return "$exit_code"
 }
@@ -384,6 +407,7 @@ main() {
   mkdir -p "$TARBALL_DIR"
   NPMRC="${WORK_DIR}/npmrc"
   PACKAGE_LIST="${WORK_DIR}/gitlab-npm-packages.tsv"
+  VERSION_COUNTS_FILE="${WORK_DIR}/gitlab-npm-version-counts.tsv"
   RESULTS_JSONL="${WORK_DIR}/results.jsonl"
   SUMMARY_JSON="${WORK_DIR}/summary.json"
   : >"$NPMRC"
@@ -405,14 +429,24 @@ main() {
 
   local discovered
   discovered="$(wc -l <"$PACKAGE_LIST" | tr -d ' ')"
-  log "Discovered ${discovered} npm package versions"
+  write_version_inventory "$PACKAGE_LIST" "$VERSION_COUNTS_FILE"
+
+  local distinct_packages
+  local multi_version_packages
+  distinct_packages="$(cut -f1 "$PACKAGE_LIST" | sort -u | wc -l | tr -d ' ')"
+  multi_version_packages="$(awk -F '\t' '{ counts[$1]++ } END { total = 0; for (name in counts) { if (counts[name] > 1) total++ }; print total }' "$PACKAGE_LIST")"
+  log "Discovered ${discovered} npm package versions across ${distinct_packages} package names"
+  log "Package names with multiple versions: ${multi_version_packages}"
+  log "Version inventory: ${VERSION_COUNTS_FILE}"
 
   local total=0
   local mirrored=0
   local skipped=0
+  local skipped_existing=0
   local failed=0
   local size_known_total=0
   local size_unknown_count=0
+  PUBLISH_RESULT=""
 
   while IFS=$'\t' read -r package_name package_version package_id project_id delete_api_path; do
     [[ -n "$package_name" ]] || continue
@@ -458,8 +492,13 @@ main() {
     local error_message=""
     if tarball="$(pack_from_gitlab "$package_name" "$package_version")" &&
        publish_to_artifactory "$tarball" "$package_ref"; then
-      mirrored=$((mirrored + 1))
-      write_result mirrored "$package_name" "$package_version" "$package_id" "$tarball" ""
+      if [[ "$PUBLISH_RESULT" == "skipped-existing" ]]; then
+        skipped_existing=$((skipped_existing + 1))
+        write_result skipped-existing "$package_name" "$package_version" "$package_id" "$tarball" ""
+      else
+        mirrored=$((mirrored + 1))
+        write_result mirrored "$package_name" "$package_version" "$package_id" "$tarball" ""
+      fi
     else
       failed=$((failed + 1))
       error_message="Failed to mirror ${package_ref}"
@@ -485,17 +524,25 @@ main() {
     --arg gitlab_registry "$GITLAB_NPM_REGISTRY" \
     --arg artifactory_registry "$ARTIFACTORY_NPM_REGISTRY" \
     --arg work_dir "$WORK_DIR" \
+    --arg version_counts_file "$VERSION_COUNTS_FILE" \
     --argjson discovered "$discovered" \
+    --argjson distinct_packages "$distinct_packages" \
+    --argjson multi_version_packages "$multi_version_packages" \
     --argjson total "$total" \
     --argjson mirrored "$mirrored" \
     --argjson skipped "$skipped" \
+    --argjson skipped_existing "$skipped_existing" \
     --argjson failed "$failed" \
     --argjson dry_run_size_bytes "$size_known_total" \
     --arg dry_run_size_human "$(format_bytes "$size_known_total")" \
     --argjson dry_run_unknown_size_count "$size_unknown_count" \
     '{gitlab_url:$gitlab_url, gitlab_scope_type:$gitlab_scope_type, gitlab_scope_id:$gitlab_scope_id,
       gitlab_registry:$gitlab_registry, artifactory_registry:$artifactory_registry, work_dir:$work_dir,
-      discovered:$discovered, selected:$total, mirrored:$mirrored, skipped:$skipped, failed:$failed,
+      version_counts_file:$version_counts_file,
+      discovered:$discovered, distinct_packages:$distinct_packages,
+      multi_version_packages:$multi_version_packages,
+      selected:$total, mirrored:$mirrored, skipped:$skipped, failed:$failed,
+      skipped_existing:$skipped_existing,
       dry_run_size_bytes:$dry_run_size_bytes, dry_run_size_human:$dry_run_size_human,
       dry_run_unknown_size_count:$dry_run_unknown_size_count,
       results:.}' \

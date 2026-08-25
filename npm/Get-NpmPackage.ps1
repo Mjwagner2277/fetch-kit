@@ -130,13 +130,64 @@ function Invoke-Http {
     }
 }
 
+function Remove-JsonMetadataKey {
+    param(
+        [Parameter(Mandatory = $true)][object]$Object,
+        [Parameter(Mandatory = $true)][string]$Key
+    )
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Key)) {
+            $Object.Remove($Key)
+        }
+        foreach ($childKey in @($Object.Keys)) {
+            if ($null -ne $Object[$childKey]) {
+                Remove-JsonMetadataKey -Object $Object[$childKey] -Key $Key
+            }
+        }
+        return
+    }
+
+    if ($Object -is [System.Collections.IEnumerable] -and -not ($Object -is [string])) {
+        foreach ($item in $Object) {
+            if ($null -ne $item) {
+                Remove-JsonMetadataKey -Object $item -Key $Key
+            }
+        }
+    }
+}
+
 function Invoke-Json {
     param([Parameter(Mandatory = $true)][string]$Uri)
     $response = Invoke-Http -Uri $Uri
     if (-not $response.Content) {
         return $null
     }
-    return $response.Content | ConvertFrom-Json
+    try {
+        return $response.Content | ConvertFrom-Json
+    }
+    catch {
+        if ($_.Exception.Message -match '-AsHashTable|different casing') {
+            $metadata = $response.Content | ConvertFrom-Json -AsHashtable
+            Remove-JsonMetadataKey -Object $metadata -Key 'users'
+            $normalizedJson = ConvertTo-Json -InputObject $metadata -Depth 100
+            return $normalizedJson | ConvertFrom-Json
+        }
+        throw
+    }
+}
+
+function Get-ObjectEntries {
+    param([Parameter(Mandatory = $true)][object]$Object)
+
+    $entries = @()
+    foreach ($property in $Object.PSObject.Properties) {
+        $entries += [pscustomobject]@{
+            Name  = [string]$property.Name
+            Value = $property.Value
+        }
+    }
+    return $entries
 }
 
 function Get-PackageMetadataUrl {
@@ -146,6 +197,15 @@ function Get-PackageMetadataUrl {
         return Join-Url -Base $Registry -Path ([System.Uri]::EscapeDataString($Name))
     }
     return Join-Url -Base $Registry -Path $Name
+}
+
+function Get-PackageVersionMetadataUrl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$VersionText
+    )
+
+    return Join-Url -Base (Get-PackageMetadataUrl -Name $Name) -Path ([System.Uri]::EscapeDataString($VersionText))
 }
 
 function ConvertTo-VersionParts {
@@ -332,36 +392,33 @@ function Select-NpmVersion {
         [Parameter(Mandatory = $true)][string]$Requirement
     )
 
-    if ($Metadata.'dist-tags' -and $Metadata.'dist-tags'.PSObject.Properties[$Requirement]) {
-        $tagVersion = [string]$Metadata.'dist-tags'.$Requirement
-        return $Metadata.versions.$tagVersion
+    $packageName = [string]$Metadata.name
+    $distTags = $Metadata.'dist-tags'
+    $versionsObject = $Metadata.versions
+
+    if ($distTags -and $distTags.PSObject.Properties[$Requirement]) {
+        $tagVersion = [string]$distTags.PSObject.Properties[$Requirement].Value
+        return $tagVersion
     }
 
-    $versions = @()
-    foreach ($property in $Metadata.versions.PSObject.Properties) {
-        $versionObject = $property.Value
+    $selectedVersionText = ''
+    foreach ($property in Get-ObjectEntries -Object $versionsObject) {
         if (-not $IncludePrerelease -and $property.Name.Contains('-')) {
             continue
         }
-        if (-not $IncludeDeprecated -and $versionObject.PSObject.Properties['deprecated']) {
-            continue
-        }
+        # npm still resolves deprecated versions when they satisfy dependency ranges.
         if (Test-VersionRequirement -VersionText $property.Name -Requirement $Requirement) {
-            $versions += $versionObject
+            if (-not $selectedVersionText -or (Compare-VersionText -Left $property.Name -Right $selectedVersionText) -gt 0) {
+                $selectedVersionText = $property.Name
+            }
         }
     }
 
-    if ($versions.Count -eq 0) {
-        throw "No version of $($Metadata.name) satisfies '$Requirement'."
+    if (-not $selectedVersionText) {
+        throw "No version of $packageName satisfies '$Requirement'."
     }
 
-    $selected = $versions[0]
-    foreach ($candidate in $versions) {
-        if ((Compare-VersionText -Left ([string]$candidate.version) -Right ([string]$selected.version)) -gt 0) {
-            $selected = $candidate
-        }
-    }
-    return $selected
+    return $selectedVersionText
 }
 
 function Get-DependencyEntries {
@@ -378,11 +435,16 @@ function Get-DependencyEntries {
     if ($IncludeDevDependencies -and $Depth -eq 0) { $sections += 'devDependencies' }
 
     foreach ($section in $sections) {
-        if (-not $PackageVersion.PSObject.Properties[$section] -or -not $PackageVersion.$section) {
+        if (-not $PackageVersion.PSObject.Properties[$section]) {
             continue
         }
 
-        foreach ($dependency in $PackageVersion.$section.PSObject.Properties) {
+        $sectionValue = $PackageVersion.PSObject.Properties[$section].Value
+        if (-not $sectionValue) {
+            continue
+        }
+
+        foreach ($dependency in Get-ObjectEntries -Object $sectionValue) {
             $entries += [pscustomobject]@{
                 Name        = $dependency.Name
                 Requirement = [string]$dependency.Value
@@ -402,27 +464,35 @@ function Save-NpmPackage {
         [Parameter(Mandatory = $true)][object]$PackageVersion
     )
 
-    if (-not $PackageVersion.dist -or -not $PackageVersion.dist.tarball) {
-        throw "Package $($PackageVersion.name) $($PackageVersion.version) does not include a dist.tarball URL."
+    $packageNameText = [string]$PackageVersion.name
+    $packageVersionText = [string]$PackageVersion.version
+    $distProperty = $PackageVersion.PSObject.Properties['dist']
+    $dist = if ($distProperty) { $distProperty.Value } else { $null }
+    $tarballUrl = if ($dist) { [string]$dist.tarball } else { '' }
+
+    if (-not $dist -or -not $tarballUrl) {
+        $typeName = $PackageVersion.GetType().FullName
+        $propertyNames = @($PackageVersion.PSObject.Properties.Name) -join ','
+        throw "Package $packageNameText $packageVersionText does not include a dist.tarball URL. Object type: $typeName. Properties: $propertyNames"
     }
 
-    $safeName = ConvertTo-SafeFileName -Value $PackageVersion.name
-    $destination = Join-Path (Join-Path $OutputDirectory 'packages') (Join-Path $safeName $PackageVersion.version)
+    $safeName = ConvertTo-SafeFileName -Value $packageNameText
+    $destination = Join-Path (Join-Path $OutputDirectory 'packages') (Join-Path $safeName $packageVersionText)
     New-Directory -Path $destination
 
-    $tarballFile = Join-Path $destination "$safeName-$($PackageVersion.version).tgz"
+    $tarballFile = Join-Path $destination "$safeName-$packageVersionText.tgz"
     $metadataFile = Join-Path $destination 'metadata.json'
     $packageFile = Join-Path $destination 'package.json'
 
     if (-not (Test-Path -LiteralPath $tarballFile)) {
-        Invoke-Http -Uri ([string]$PackageVersion.dist.tarball) -OutFile $tarballFile | Out-Null
+        Invoke-Http -Uri $tarballUrl -OutFile $tarballFile | Out-Null
     }
 
-    if ($PackageVersion.dist.PSObject.Properties['shasum'] -and $PackageVersion.dist.shasum) {
+    if ($dist.PSObject.Properties['shasum']) {
         $actualSha1 = (Get-FileHash -LiteralPath $tarballFile -Algorithm SHA1).Hash.ToLowerInvariant()
-        $expectedSha1 = ([string]$PackageVersion.dist.shasum).ToLowerInvariant()
+        $expectedSha1 = ([string]$dist.shasum).ToLowerInvariant()
         if ($actualSha1 -ne $expectedSha1) {
-            throw "Checksum mismatch for $($PackageVersion.name) $($PackageVersion.version). Expected $expectedSha1 but found $actualSha1."
+            throw "Checksum mismatch for $packageNameText $packageVersionText. Expected $expectedSha1 but found $actualSha1."
         }
     }
 
@@ -430,12 +500,12 @@ function Save-NpmPackage {
     $PackageVersion | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $packageFile -Encoding UTF8
 
     return [pscustomobject]@{
-        Name         = $PackageVersion.name
-        Version      = $PackageVersion.version
+        Name         = $packageNameText
+        Version      = $packageVersionText
         TarballFile  = $tarballFile
         MetadataFile = $metadataFile
         PackageFile  = $packageFile
-        TarballUrl   = [string]$PackageVersion.dist.tarball
+        TarballUrl   = $tarballUrl
     }
 }
 
@@ -568,8 +638,10 @@ function Resolve-NpmDependencyGraph {
             }
 
             $metadata = $metadataCache[$request.Name]
-            $selected = Select-NpmVersion -Metadata $metadata -Requirement ([string]$request.Requirement)
-            $key = "$($selected.name)@$($selected.version)"
+            $selectedVersion = [string](Select-NpmVersion -Metadata $metadata -Requirement ([string]$request.Requirement))
+            $selected = Invoke-Json -Uri (Get-PackageVersionMetadataUrl -Name $request.Name -VersionText $selectedVersion)
+            $selectedName = [string]$selected.name
+            $key = "$selectedName@$selectedVersion"
             $edges += [pscustomobject]@{
                 From        = $request.Parent
                 To          = $key
@@ -584,8 +656,8 @@ function Resolve-NpmDependencyGraph {
             }
 
             $resolved[$key] = [pscustomobject]@{
-                Name        = $selected.name
-                Version     = $selected.version
+                Name        = $selectedName
+                Version     = $selectedVersion
                 Requirement = $request.Requirement
                 Parent      = $request.Parent
                 Kind        = $request.Kind
