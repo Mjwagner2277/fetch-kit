@@ -51,10 +51,54 @@ $env:NPM_TOKEN = "npm_..."
   -BearerToken $env:NPM_TOKEN
 ```
 
+Prepare a USB-transferable Artifactory upload bundle from an internet-connected
+machine:
+
+```powershell
+.\npm\Get-NpmPackage.ps1 `
+  -Package "@company/app" `
+  -Version "1.2.3" `
+  -Registry "https://registry.npmjs.org/" `
+  -OutputDirectory ".\npm-airgap-cache" `
+  -IncludeOptionalDependencies `
+  -IncludePeerDependencies
+```
+
+Copy only this directory to the air-gapped environment:
+
+```text
+.\npm-airgap-cache\artifactory-upload
+```
+
+Publish that transferred bundle to Artifactory inside the air-gapped
+Linux environment:
+
+```bash
+export ARTIFACTORY_TOKEN="..."
+
+./publish-npm-package-bundle.sh \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --token "$ARTIFACTORY_TOKEN" \
+  --skip-existing
+```
+
 Run a random five-package sample from the repository's popular-package list:
 
 ```powershell
 .\npm\Test-NpmPackageSample.ps1
+```
+
+Mirror every npm package version from a GitLab project or group package registry
+to an Artifactory npm repository:
+
+```bash
+GITLAB_URL=https://gitlab.example.com \
+GITLAB_TOKEN=glpat-... \
+GITLAB_SCOPE_TYPE=project \
+GITLAB_SCOPE_ID=12345 \
+ARTIFACTORY_NPM_REGISTRY=https://art.example.com/artifactory/api/npm/npm-local/ \
+ARTIFACTORY_TOKEN=... \
+  ./npm/mirror-gitlab-npm-to-artifactory.sh
 ```
 
 ## Output
@@ -85,6 +129,27 @@ The command prints a JSON summary with:
 - `Downloads`: tarball and metadata paths.
 - `Failures`: resolution or download failures.
 - `Output`: cache root.
+
+Unless `-SkipArtifactoryBundle` is passed, the script also writes a
+publish-ready bundle under:
+
+```text
+npm-package-cache/
+  artifactory-upload/
+    README.txt
+    packages.json
+    packages.tsv
+    retrieval-summary.json
+    publish-npm-package-bundle.sh
+    tarballs/
+      package-version.tgz
+```
+
+That `artifactory-upload` directory is the part intended for USB transfer. The
+tarballs are flattened into one directory, and `packages.json` records package
+name, version, tarball path, original source metadata paths, source tarball URL,
+SHA-1, and SHA-512. The Bash offline publish script verifies the SHA-1 before
+publishing each tarball.
 
 ## Dependency Resolution Behavior
 
@@ -138,6 +203,50 @@ collecting npm registry source artifacts for offline review or mirroring.
 - `-BearerToken`: bearer token for private registries, defaults to
   `$env:NPM_TOKEN`.
 - `-Username` and `-Password`: basic authentication fallback.
+- `-SkipArtifactoryBundle`: only write the resolver cache layout and skip the
+  publish-ready `artifactory-upload` directory.
+
+## Air-Gapped Artifactory Workflow
+
+The intended disconnected workflow is:
+
+1. On an internet-connected asset, run `Get-NpmPackage.ps1` for each root
+   application/package that must be available offline. Use `-MaxDepth 0`, the
+   default, to retrieve the full dependency tree selected by the resolver.
+2. Review `Failures` in the JSON output. Do not transfer the bundle until
+   `FailureCount` is `0`, unless you intentionally accept missing optional or
+   peer packages.
+3. Transfer the whole `artifactory-upload` directory to the air-gapped
+   environment.
+4. On the air-gapped Linux side, run `publish-npm-package-bundle.sh` from inside
+   that transferred directory.
+
+The Linux offline publisher requires Bash, `jq`, `sha1sum`, and `npm` because
+Artifactory accepts standard npm package publication through
+`npm publish --registry`. It does not need internet access.
+
+Offline publisher examples:
+
+```bash
+# Token authentication
+./publish-npm-package-bundle.sh \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --token "$ARTIFACTORY_TOKEN" \
+  --skip-existing
+
+# Username/password or API key authentication
+./publish-npm-package-bundle.sh \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --username "$ARTIFACTORY_USERNAME" \
+  --password "$ARTIFACTORY_PASSWORD" \
+  --skip-existing
+
+# Validate bundle and show what would publish
+./publish-npm-package-bundle.sh \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --token "$ARTIFACTORY_TOKEN" \
+  --dry-run
+```
 
 ## Sample Test Harness
 
@@ -153,3 +262,78 @@ selected package. It writes:
 The harness defaults to `-MaxDepth 2` so random samples stay bounded while still
 testing recursive dependency retrieval. Pass `-MaxDepth 0` to walk the full
 registry dependency graph for each sampled package.
+
+## GitLab to Artifactory Mirror
+
+`mirror-gitlab-npm-to-artifactory.sh` copies already-published npm package
+versions from GitLab Package Registry to an Artifactory npm repository. It uses:
+
+- GitLab Packages API pagination to list package versions.
+- GitLab npm registry access through `npm pack`.
+- Artifactory npm publishing through `npm publish --registry`.
+
+Required tools:
+
+- `bash`
+- `curl`
+- `jq`
+- `npm`
+
+Required environment variables:
+
+- `GITLAB_URL`: base GitLab URL, such as `https://gitlab.example.com`.
+- `GITLAB_TOKEN`: GitLab token with API and package read access.
+- `GITLAB_SCOPE_TYPE`: `project` or `group`.
+- `GITLAB_SCOPE_ID`: project/group numeric ID or URL path.
+- `ARTIFACTORY_NPM_REGISTRY`: target Artifactory npm registry URL, normally
+  `https://host/artifactory/api/npm/<repo>/`.
+- `ARTIFACTORY_TOKEN`: Artifactory token for npm publishing. Alternatively set
+  `ARTIFACTORY_USERNAME` and `ARTIFACTORY_PASSWORD`.
+
+Useful optional settings:
+
+- `GITLAB_NPM_REGISTRY`: override the source npm registry URL.
+- `GITLAB_PACKAGE_STATUS`: package status filter. Defaults to `default`; set
+  `all` to omit the status filter.
+- `WORK_DIR`: where tarballs, logs, and summary files are written.
+- `KEEP_WORK_DIR=true`: keep the temporary work directory after completion.
+- `SKIP_EXISTING=true`: treat already-published Artifactory versions as success.
+  This is the default.
+- `DRY_RUN=true`: list packages without downloading or publishing.
+- `DRY_RUN_SIZE=true`: query GitLab package-file metadata and include total
+  package file size in the dry-run summary. This is the default. Set
+  `DRY_RUN_SIZE=false` to avoid the extra GitLab API calls.
+- `INCLUDE_PACKAGE_REGEX` and `EXCLUDE_PACKAGE_REGEX`: limit package names.
+
+For a group registry, use:
+
+```bash
+GITLAB_SCOPE_TYPE=group \
+GITLAB_SCOPE_ID=my-group/subgroup \
+  ./npm/mirror-gitlab-npm-to-artifactory.sh
+```
+
+The script writes a JSON summary to stdout and stores `results.jsonl` plus
+`summary.json` in `WORK_DIR`. It exits non-zero if any selected package version
+fails to mirror.
+
+Dry-run sizing example:
+
+```bash
+DRY_RUN=true \
+GITLAB_URL=https://gitlab.example.com \
+GITLAB_TOKEN=glpat-... \
+GITLAB_SCOPE_TYPE=project \
+GITLAB_SCOPE_ID=12345 \
+ARTIFACTORY_NPM_REGISTRY=https://art.example.com/artifactory/api/npm/npm-local/ \
+ARTIFACTORY_TOKEN=... \
+  ./npm/mirror-gitlab-npm-to-artifactory.sh
+```
+
+The summary includes `dry_run_size_bytes`, `dry_run_size_human`, and
+`dry_run_unknown_size_count`, and the script logs the total known size at the
+end of the dry run. GitLab's package list API does not include package file size
+directly, so the script totals the `size` fields from the package files endpoint
+for each package version. Project scope supports this directly. Group scope
+depends on GitLab returning enough project/link metadata to locate the
+package-files endpoint; otherwise the package is counted as unknown size.

@@ -34,6 +34,10 @@ See [rust/README.md](rust/README.md) for examples and limitations.
 See [npm/README.md](npm/README.md) for examples and limitations.
 The npm directory also includes `Test-NpmPackageSample.ps1`, which randomly
 tests five packages from a checked-in popular-package sample list.
+The PowerShell npm retriever writes a USB-transferable Artifactory upload bundle
+with a Bash publisher for air-gapped Linux hosts.
+It also includes a Bash GitLab-to-Artifactory npm mirror script for moving
+published package versions between registries.
 
 ## RPM
 

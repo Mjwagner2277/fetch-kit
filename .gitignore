@@ -12,3 +12,8 @@ sample-openh264-test/
 *-localrepo.tar.gz
 *.rpm
 metadata-cache/
+npm-package-cache/
+npm-package-cache-sample/
+npm-airgap-cache/
+npm/**/sample-results/
+npm/**/artifactory-upload/

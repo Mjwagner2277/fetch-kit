@@ -54,7 +54,10 @@ param(
     [string]$Username = $env:NPM_USERNAME,
 
     [Parameter()]
-    [string]$Password = $env:NPM_PASSWORD
+    [string]$Password = $env:NPM_PASSWORD,
+
+    [Parameter()]
+    [switch]$SkipArtifactoryBundle
 )
 
 Set-StrictMode -Version Latest
@@ -436,6 +439,103 @@ function Save-NpmPackage {
     }
 }
 
+function Get-RelativePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$BasePath,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $baseFullPath = [System.IO.Path]::GetFullPath($BasePath)
+    $targetFullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $baseFullPath.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+        $baseFullPath += [System.IO.Path]::DirectorySeparatorChar
+    }
+
+    $baseUri = [System.Uri]::new($baseFullPath)
+    $targetUri = [System.Uri]::new($targetFullPath)
+    return [System.Uri]::UnescapeDataString($baseUri.MakeRelativeUri($targetUri).ToString()).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+}
+
+function Write-ArtifactoryBundle {
+    param([Parameter(Mandatory = $true)][object]$Summary)
+
+    $bundleRoot = Join-Path $OutputDirectory 'artifactory-upload'
+    $tarballRoot = Join-Path $bundleRoot 'tarballs'
+    New-Directory -Path $bundleRoot
+    New-Directory -Path $tarballRoot
+
+    $manifestItems = @()
+    foreach ($download in @($Summary.Downloads | Sort-Object Name, Version)) {
+        $safeName = ConvertTo-SafeFileName -Value $download.Name
+        $publishFileName = "$safeName-$($download.Version).tgz"
+        $publishTarball = Join-Path $tarballRoot $publishFileName
+        Copy-Item -LiteralPath $download.TarballFile -Destination $publishTarball -Force
+
+        $sha1 = (Get-FileHash -LiteralPath $publishTarball -Algorithm SHA1).Hash.ToLowerInvariant()
+        $sha512 = (Get-FileHash -LiteralPath $publishTarball -Algorithm SHA512).Hash.ToLowerInvariant()
+
+        $manifestItems += [pscustomobject]@{
+            Name                = $download.Name
+            Version             = $download.Version
+            Package             = "$($download.Name)@$($download.Version)"
+            Tarball             = (Get-RelativePath -BasePath $bundleRoot -Path $publishTarball).Replace('\', '/')
+            SourceTarball       = (Get-RelativePath -BasePath $OutputDirectory -Path $download.TarballFile).Replace('\', '/')
+            SourceMetadata      = (Get-RelativePath -BasePath $OutputDirectory -Path $download.MetadataFile).Replace('\', '/')
+            SourcePackageJson   = (Get-RelativePath -BasePath $OutputDirectory -Path $download.PackageFile).Replace('\', '/')
+            SourceTarballUrl    = $download.TarballUrl
+            Sha1                = $sha1
+            Sha512              = $sha512
+        }
+    }
+
+    $manifestFile = Join-Path $bundleRoot 'packages.json'
+    $tsvFile = Join-Path $bundleRoot 'packages.tsv'
+    $summaryFile = Join-Path $bundleRoot 'retrieval-summary.json'
+    $readmeFile = Join-Path $bundleRoot 'README.txt'
+    $bashPublishScript = Join-Path $bundleRoot 'publish-npm-package-bundle.sh'
+    $sourceBashPublishScript = Join-Path $PSScriptRoot 'publish-npm-package-bundle.sh'
+
+    $manifestItems | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestFile -Encoding UTF8
+    $Summary | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $summaryFile -Encoding UTF8
+
+    $tsvRows = @('Name	Version	Package	Tarball	Sha1	Sha512')
+    foreach ($item in $manifestItems) {
+        $tsvRows += "$($item.Name)`t$($item.Version)`t$($item.Package)`t$($item.Tarball)`t$($item.Sha1)`t$($item.Sha512)"
+    }
+    $tsvRows | Set-Content -LiteralPath $tsvFile -Encoding UTF8
+
+    if (Test-Path -LiteralPath $sourceBashPublishScript) {
+        Copy-Item -LiteralPath $sourceBashPublishScript -Destination $bashPublishScript -Force
+    }
+
+    @(
+        'npm Artifactory upload bundle',
+        '',
+        'Transfer this whole artifactory-upload directory into the airgapped environment.',
+        '',
+        'Publish from a Linux airgapped asset with:',
+        '  ./publish-npm-package-bundle.sh --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" --token "$ARTIFACTORY_TOKEN" --skip-existing',
+        '',
+        'Files:',
+        '  packages.json             Machine-readable publish manifest.',
+        '  packages.tsv              Human-readable package list.',
+        '  retrieval-summary.json    Original resolver output.',
+        '  tarballs/                 Flat publish-ready npm .tgz files.',
+        '  publish-npm-package-bundle.sh  Bash offline publishing helper.'
+    ) | Set-Content -LiteralPath $readmeFile -Encoding UTF8
+
+    return [pscustomobject]@{
+        BundleRoot       = $bundleRoot
+        TarballDirectory = $tarballRoot
+        ManifestFile     = $manifestFile
+        TsvFile          = $tsvFile
+        SummaryFile      = $summaryFile
+        ReadmeFile       = $readmeFile
+        BashPublishScript = if (Test-Path -LiteralPath $bashPublishScript) { $bashPublishScript } else { $null }
+        PackageCount     = $manifestItems.Count
+    }
+}
+
 function Resolve-NpmDependencyGraph {
     param(
         [Parameter(Mandatory = $true)][string]$RootPackage,
@@ -530,4 +630,7 @@ function Resolve-NpmDependencyGraph {
 
 New-Directory -Path $OutputDirectory
 $summary = Resolve-NpmDependencyGraph -RootPackage $Package -RootRequirement $Version
+if (-not $SkipArtifactoryBundle) {
+    $summary | Add-Member -NotePropertyName ArtifactoryBundle -NotePropertyValue (Write-ArtifactoryBundle -Summary $summary)
+}
 $summary | ConvertTo-Json -Depth 100
