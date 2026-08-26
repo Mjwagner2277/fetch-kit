@@ -386,6 +386,27 @@ function Test-VersionRequirement {
     return $false
 }
 
+function ConvertFrom-NpmDependencySpec {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Requirement
+    )
+
+    if ($Requirement -match '^npm:(@[^/]+/[^@]+|[^@]+)@(.+)$') {
+        return [pscustomobject]@{
+            Name        = $Matches[1]
+            Requirement = $Matches[2]
+            Alias       = $Name
+        }
+    }
+
+    return [pscustomobject]@{
+        Name        = $Name
+        Requirement = $Requirement
+        Alias       = $null
+    }
+}
+
 function Select-NpmVersion {
     param(
         [Parameter(Mandatory = $true)][object]$Metadata,
@@ -402,8 +423,9 @@ function Select-NpmVersion {
     }
 
     $selectedVersionText = ''
+    $allowPrerelease = [bool]$IncludePrerelease -or ($Requirement -match '\d+\.\d+\.\d+-')
     foreach ($property in Get-ObjectEntries -Object $versionsObject) {
-        if (-not $IncludePrerelease -and $property.Name.Contains('-')) {
+        if (-not $allowPrerelease -and $property.Name.Contains('-')) {
             continue
         }
         # npm still resolves deprecated versions when they satisfy dependency ranges.
@@ -445,9 +467,11 @@ function Get-DependencyEntries {
         }
 
         foreach ($dependency in Get-ObjectEntries -Object $sectionValue) {
+            $dependencySpec = ConvertFrom-NpmDependencySpec -Name $dependency.Name -Requirement ([string]$dependency.Value)
             $entries += [pscustomobject]@{
-                Name        = $dependency.Name
-                Requirement = [string]$dependency.Value
+                Name        = $dependencySpec.Name
+                Requirement = $dependencySpec.Requirement
+                Alias       = $dependencySpec.Alias
                 Parent      = $ParentKey
                 Kind        = $section
                 Depth       = $Depth + 1
@@ -621,6 +645,7 @@ function Resolve-NpmDependencyGraph {
     $queue.Enqueue([pscustomobject]@{
         Name        = $RootPackage
         Requirement = $RootRequirement
+        Alias       = $null
         Parent      = $null
         Kind        = 'root'
         Depth       = 0
@@ -647,6 +672,7 @@ function Resolve-NpmDependencyGraph {
                 To          = $key
                 Name        = $request.Name
                 Requirement = $request.Requirement
+                Alias       = $request.Alias
                 Kind        = $request.Kind
                 Depth       = $request.Depth
             }
@@ -659,6 +685,7 @@ function Resolve-NpmDependencyGraph {
                 Name        = $selectedName
                 Version     = $selectedVersion
                 Requirement = $request.Requirement
+                Alias       = $request.Alias
                 Parent      = $request.Parent
                 Kind        = $request.Kind
                 Depth       = $request.Depth
@@ -673,6 +700,7 @@ function Resolve-NpmDependencyGraph {
             $failures += [pscustomobject]@{
                 Name        = $request.Name
                 Requirement = $request.Requirement
+                Alias       = $request.Alias
                 Parent      = $request.Parent
                 Kind        = $request.Kind
                 Depth       = $request.Depth

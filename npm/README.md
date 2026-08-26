@@ -168,9 +168,15 @@ chooses the highest matching non-prerelease version by default. Deprecated
 versions remain eligible because npm can still resolve them in dependency
 graphs.
 
-Use `-IncludePrerelease` when prerelease versions must be eligible during
-selection. `-IncludeDeprecated` is still accepted for compatibility with older
-commands, but deprecated versions are no longer filtered by default.
+Prerelease versions are eligible when the requested range itself names a
+prerelease, such as `^1.0.0-beta.2`. Use `-IncludePrerelease` when prerelease
+versions must be eligible for ordinary ranges too. `-IncludeDeprecated` is still
+accepted for compatibility with older commands, but deprecated versions are no
+longer filtered by default.
+
+Dependency entries that use npm alias syntax, such as
+`react-is-18: npm:react-is@^18.3.1`, are resolved through the real package name
+while the alias is preserved in the summary graph.
 
 ## Important Differences From npm
 
