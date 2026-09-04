@@ -222,6 +222,56 @@ See [`artifactory-upload/README.md`](artifactory-upload/README.md) for
 authentication options, upload ordering details, local testing instructions, and
 Artifactory examples.
 
+## Vulnerability CSV
+
+`Get-GoVulnDb.py` mirrors the Go vulnerability database zip so it can be moved
+with the package archive:
+
+```bash
+python3 Get-GoVulnDb.py --output go-vulndb/vulndb.zip
+```
+
+`Scan-GoProxyVulns.py` scans downloaded module versions in a static proxy cache
+against that offline database and writes a CSV:
+
+```bash
+python3 Scan-GoProxyVulns.py \
+  --go-proxy-directory go-proxy-cache \
+  --vuln-db go-vulndb/vulndb.zip \
+  --output-csv go-vuln-report.csv
+```
+
+The scanner is a module-version scan. It does not do `govulncheck` reachability
+or symbol analysis, so findings mean the downloaded version matches an affected
+range, not necessarily that an application calls vulnerable code.
+
+The CSV includes every downloaded package/module version, its `go` directive,
+the number of matching advisories, the highest-ranked CVE/advisory, fixed
+version, and the fixed version's `go` directive. The fixed Go directive comes
+from the local proxy cache when present; when the helper is given `--proxy`, it
+can also look up the fixed version's `.mod` file from that proxy during the
+connected-side run.
+
+Run the whole connected-side workflow with one helper:
+
+```bash
+python3 Run-GoAirgapWorkflow.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1 \
+  --proxy https://proxy.golang.org \
+  --output-directory go-airgap-output
+```
+
+That writes:
+
+```text
+go-airgap-output/go-proxy-cache/
+go-airgap-output/go-proxy-cache.tar.gz
+go-airgap-output/go-vulndb/vulndb.zip
+go-airgap-output/go-vuln-report.csv
+go-airgap-output/go-vuln-report.json
+```
+
 ## Local Smoke Test
 
 The smoke test uses local Python HTTP servers and the local Go command. It does
@@ -230,9 +280,11 @@ not require PowerShell.
 ```bash
 ./tests/smoke-static-goproxy.sh
 ./tests/smoke-goproxy-artifactory-e2e.sh
+./tests/smoke-go-vuln-workflow.sh
 ```
 
 The first test verifies static proxy output can be consumed by `go`. The second
 test verifies the full handoff flow: download, tar, extract, upload to a local
 Artifactory-style endpoint, then consume that endpoint with `go mod download`
-and `go install package@version`.
+and `go install package@version`. The third test verifies the wrapper and
+offline vulnerability CSV generation with a synthetic vuln DB.

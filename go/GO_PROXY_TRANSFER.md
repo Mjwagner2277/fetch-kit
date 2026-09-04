@@ -158,6 +158,33 @@ Use `GOSUMDB=off` only for isolated environments that cannot reach the public
 checksum database. If you run an internal checksum database, point `GOSUMDB` at
 that instead.
 
+## Vulnerability Report Handoff
+
+For a connected-side run that downloads packages, mirrors the Go vulnerability
+database, creates the tar.gz transfer artifact, and writes the CSV report:
+
+```bash
+python3 Run-GoAirgapWorkflow.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1 \
+  --proxy https://proxy.golang.org \
+  --output-directory go-airgap-output
+```
+
+Transfer these files together:
+
+```text
+go-airgap-output/go-proxy-cache.tar.gz
+go-airgap-output/go-vulndb/vulndb.zip
+go-airgap-output/go-vuln-report.csv
+```
+
+The CSV is a module-version report. It includes every downloaded package/module
+version, matching vulnerability count, highest-ranked CVE/advisory, fixed
+version, and the fixed version's Go directive. The helper can read the fixed Go
+directive from the same `--proxy` during the connected-side run even when the
+fixed version itself was not downloaded into the transfer cache.
+
 ## Local Smoke Test
 
 The smoke test is intentionally separate from `Get-GoLibrary.py`. It uses
