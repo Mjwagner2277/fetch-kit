@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for command_name in go pwsh python3; do
+for command_name in go python3; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "missing required command: $command_name" >&2
     exit 1
@@ -102,11 +102,11 @@ upstream_pid="$started_server_pid"
 retrieval_result="$tmp_dir/retrieval-result.json"
 package_list="$tmp_dir/package-list.txt"
 printf 'example.com/smoke\n' > "$package_list"
-pwsh -NoLogo -NoProfile -File "$repo_root/Get-GoLibrary.ps1" \
-  -PackageListPath "$package_list" \
-  -GoVersion 1.26.5-1 \
-  -Proxy "http://127.0.0.1:$upstream_port" \
-  -GoProxyDirectory "$export_dir" >"$retrieval_result"
+python3 "$repo_root/Get-GoLibrary.py" \
+  --package-list-path "$package_list" \
+  --go-version 1.26.5-1 \
+  --proxy "http://127.0.0.1:$upstream_port" \
+  --go-proxy-directory "$export_dir" >"$retrieval_result"
 
 python3 - "$retrieval_result" <<'PY'
 import json
@@ -135,11 +135,11 @@ if requested["CompatibleGoDirective"] != "1.26":
 PY
 
 cached_result="$tmp_dir/cached-result.json"
-pwsh -NoLogo -NoProfile -File "$repo_root/Get-GoLibrary.ps1" \
-  -PackageListPath "$package_list" \
-  -GoVersion 1.26.5-1 \
-  -Proxy off \
-  -GoProxyDirectory "$export_dir" >"$cached_result"
+python3 "$repo_root/Get-GoLibrary.py" \
+  --package-list-path "$package_list" \
+  --go-version 1.26.5-1 \
+  --proxy off \
+  --go-proxy-directory "$export_dir" >"$cached_result"
 
 python3 - "$cached_result" <<'PY'
 import json

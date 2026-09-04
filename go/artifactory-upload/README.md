@@ -6,11 +6,12 @@ API.
 
 It is intended for the second half of an air-gap or constrained-network flow:
 
-1. Use `../Get-GoLibrary.ps1 -GoProxyDirectory` to create a static Go proxy
-   directory.
-2. Transfer that directory to the environment that can reach Artifactory.
-3. Run `upload-go-proxy-to-artifactory.sh` to publish the proxy tree.
-4. Point Go clients at the Artifactory repository URL with `GOPROXY`.
+1. Use `../Get-GoLibrary.py --go-proxy-directory --archive-output` to create a
+   static Go proxy directory and tar.gz transfer artifact.
+2. Transfer the tar.gz to the environment that can reach Artifactory.
+3. Extract it into a staging directory.
+4. Run `upload-go-proxy-to-artifactory.sh` to publish the proxy tree.
+5. Point Go clients at the Artifactory repository URL with `GOPROXY`.
 
 The script does not require the Go toolchain, the JFrog CLI, or any Artifactory
 client library. It uses standard Unix tools and `curl`.
@@ -22,6 +23,10 @@ client library. It uses standard Unix tools and `curl`.
 - `smoke-static-goproxy-artifactory-upload.sh` - Local smoke test. It starts a
   small HTTP server that behaves like Artifactory's upload endpoint and verifies
   paths, content, authentication, filtering, and upload order.
+- `../tests/smoke-goproxy-artifactory-e2e.sh` - Full local handoff smoke test.
+  It downloads from a fake upstream proxy, creates a tar.gz transfer archive,
+  extracts it, uploads it, and verifies `go mod download` and `go install`
+  against the local Artifactory-style endpoint.
 
 ## Source Layout
 
@@ -35,7 +40,7 @@ github.com/example/project/@v/v1.2.3.mod
 github.com/example/project/@v/v1.2.3.zip
 ```
 
-`Get-GoLibrary.ps1 -GoProxyDirectory` writes this layout directly. A directory
+`Get-GoLibrary.py --go-proxy-directory` writes this layout directly. A directory
 already served by nginx as a static Go proxy is also suitable.
 
 ## Artifactory Repository
@@ -121,11 +126,18 @@ to match the local filesystem exactly:
 
 ## Basic Upload
 
+If the connected host created a transfer archive, extract it first:
+
+```bash
+mkdir -p /tmp/go-proxy-cache
+tar -xzf go-proxy-cache.tar.gz -C /tmp/go-proxy-cache
+```
+
 Use an access token through the environment:
 
 ```bash
 ARTIFACTORY_TOKEN=... ./upload-go-proxy-to-artifactory.sh \
-  --source-dir ./go-proxy-cache \
+  --source-dir /tmp/go-proxy-cache \
   --artifactory-url https://artifactory.example.com/artifactory \
   --repo go-local
 ```
@@ -240,6 +252,15 @@ accepts Artifactory-style `PUT` requests, runs the uploader, and verifies:
 
 The smoke test does not require Docker or Artifactory.
 
+Run the full local handoff test from the `go` folder:
+
+```bash
+./tests/smoke-goproxy-artifactory-e2e.sh
+```
+
+That test exercises the Python downloader, tar archive creation, extraction,
+the Bash uploader, and Go client consumption from the uploaded local endpoint.
+
 ## Real Local Artifactory Test
 
 For a full end-to-end local test, Docker Desktop must be running. Current
@@ -312,3 +333,9 @@ for OSS testing.
 
 `curl: (60) SSL certificate problem`: install the Artifactory CA certificate in
 the host trust store. Use `--insecure` only for disposable local testing.
+
+`go: refusing to pass credentials to insecure URL`: the Go command will not send
+credentials embedded in an `http://` `GOPROXY` URL. Use HTTPS for authenticated
+Artifactory reads, enable anonymous read for the repository in a disposable
+local test, or put a local test proxy in front of Artifactory that injects
+credentials.

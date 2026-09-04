@@ -4,7 +4,7 @@
 #
 # The source directory is expected to be the document root for a static Go proxy,
 # for example a directory served by nginx or exported by fetch-kit's
-# Get-GoLibrary.ps1 -GoProxyDirectory option:
+# Get-GoLibrary.py --go-proxy-directory option:
 #
 #   example.com/module/@v/list
 #   example.com/module/@v/v1.2.3.info

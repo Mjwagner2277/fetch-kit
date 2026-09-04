@@ -1,6 +1,6 @@
 # Static Go Proxy Transfer
 
-`Get-GoLibrary.ps1` can write a proxy-native output tree shaped like the Go
+`Get-GoLibrary.py` can write a proxy-native output tree shaped like the Go
 module proxy protocol. Copy that tree to a Linux host and merge it into an
 existing static internal Go proxy.
 
@@ -23,42 +23,45 @@ Or start with `recommended-go-tools.txt` and remove anything your environment
 does not need.
 
 Download the latest versions compatible with your target Go version and export
-static proxy files:
+static proxy files plus a transfer archive:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -PackageListPath .\go-tools.txt `
-  -GoVersion 1.26.5-1 `
-  -Proxy @("https://proxy.golang.org") `
-  -GoProxyDirectory .\go-proxy-cache
+```bash
+python3 Get-GoLibrary.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1 \
+  --proxy https://proxy.golang.org \
+  --go-proxy-directory go-proxy-cache \
+  --archive-output go-proxy-cache.tar.gz
 ```
 
-In this mode, `-GoProxyDirectory` is the artifact you transfer. Because
-`-OutputDirectory` is not provided and `-Expand` is not used, the script uses a
-temporary working cache and removes it after the proxy tree is written.
+In this mode, `--go-proxy-directory` is the local cache root and
+`--archive-output` is the artifact you transfer. The archive contains the
+contents of the proxy root, not a nested `go-proxy-cache` parent folder. Because
+`--output-directory` is not provided and `--expand` is not used, the script uses
+a temporary working cache and removes it after the proxy tree is written.
 
-The script checks `-GoProxyDirectory` before downloading. If a complete module
+The script checks `--go-proxy-directory` before downloading. If a complete module
 version already exists there, it reuses the existing `.info`, `.mod`, `.zip`, and
-`list` files. Bare entries resolved with `-GoVersion` also prefer compatible
+`list` files. Bare entries resolved with `--go-version` also prefer compatible
 versions already present in the proxy directory before calling an upstream proxy.
 
 For dependency closure from each root package, add:
 
-```powershell
--ResolveDependencies
+```bash
+--resolve-dependencies
 ```
 
 If you also want a durable download cache or expanded source for inspection,
-provide `-OutputDirectory` explicitly:
+provide `--output-directory` explicitly:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -PackageListPath .\go-tools.txt `
-  -GoVersion 1.26.5-1 `
-  -Proxy @("https://proxy.golang.org") `
-  -GoProxyDirectory .\go-proxy-cache `
-  -OutputDirectory .\go-library-cache `
-  -Expand
+```bash
+python3 Get-GoLibrary.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1 \
+  --proxy https://proxy.golang.org \
+  --go-proxy-directory go-proxy-cache \
+  --output-directory go-library-cache \
+  --expand
 ```
 
 You can still pin exact versions when needed:
@@ -68,7 +71,7 @@ golang.org/x/tools/gopls@v0.23.0
 github.com/boumenot/gocover-cobertura v1.5.0
 ```
 
-Pinned entries do not require `-GoVersion`; bare entries do.
+Pinned entries do not require `--go-version`; bare entries do.
 
 Built-in short names currently include:
 
@@ -91,7 +94,7 @@ Built-in short names currently include:
 
 ## Resulting Proxy Layout
 
-The `-GoProxyDirectory` tree uses the protocol layout expected by the Go
+The `--go-proxy-directory` tree uses the protocol layout expected by the Go
 command:
 
 ```text
@@ -107,17 +110,25 @@ Uppercase module path characters are escaped using the Go proxy convention.
 
 ## Transfer And Install On Linux
 
-Copy `go-proxy-cache` to the Linux host, then run:
+Copy `go-proxy-cache.tar.gz` to the Linux host, then extract into a staging
+directory:
 
 ```bash
-sudo ./scripts/install-static-goproxy-cache.sh ./go-proxy-cache /srv/goproxy
+mkdir -p /tmp/go-proxy-cache
+tar -xzf go-proxy-cache.tar.gz -C /tmp/go-proxy-cache
+```
+
+To merge into an existing static file Go proxy, run:
+
+```bash
+sudo ./scripts/install-static-goproxy-cache.sh /tmp/go-proxy-cache /srv/goproxy
 ```
 
 If your existing static proxy root is already writable by your user or your
 deployment account, skip `sudo`:
 
 ```bash
-./scripts/install-static-goproxy-cache.sh --no-sudo ./go-proxy-cache /srv/goproxy
+./scripts/install-static-goproxy-cache.sh --no-sudo /tmp/go-proxy-cache /srv/goproxy
 ```
 
 The helper merges files additively. It does not delete existing module versions.
@@ -134,13 +145,22 @@ go env -w GOPROXY=https://goproxy.internal.example.com
 go env -w GOSUMDB=off
 ```
 
+To upload the same extracted tree into Artifactory instead, run:
+
+```bash
+ARTIFACTORY_TOKEN=... ./artifactory-upload/upload-go-proxy-to-artifactory.sh \
+  --source-dir /tmp/go-proxy-cache \
+  --artifactory-url https://artifactory.example.com/artifactory \
+  --repo go-local
+```
+
 Use `GOSUMDB=off` only for isolated environments that cannot reach the public
 checksum database. If you run an internal checksum database, point `GOSUMDB` at
 that instead.
 
 ## Local Smoke Test
 
-The smoke test is intentionally separate from `Get-GoLibrary.ps1`. It uses
+The smoke test is intentionally separate from `Get-GoLibrary.py`. It uses
 local Python HTTP servers and the local Go command, which the production transfer
 host may not have.
 
@@ -149,6 +169,6 @@ host may not have.
 ```
 
 The test creates a fake upstream Go proxy, downloads one module with
-`Get-GoLibrary.ps1`, exports it to static proxy layout, installs that export
+`Get-GoLibrary.py`, exports it to static proxy layout, installs that export
 into a temporary static proxy root, and verifies both `go mod download` and
 `go install package@version` can consume it.

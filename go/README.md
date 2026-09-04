@@ -1,7 +1,8 @@
-# PowerShell Go Library Retrieval
+# Python Go Library Retrieval
 
-`Get-GoLibrary.ps1` retrieves Go module source zips without calling the Go
-toolchain or Git. It uses only PowerShell HTTP calls.
+`Get-GoLibrary.py` retrieves Go module source zips without calling the Go
+toolchain or Git. It uses Python HTTP and archive libraries and writes JSON to
+stdout. Progress messages are written to stderr with a `[go-fetch]` prefix.
 
 ## What It Can Retrieve
 
@@ -16,68 +17,86 @@ toolchain or Git. It uses only PowerShell HTTP calls.
 - Basic `go-import` vanity path discovery when the resolved repository is hosted
   on GitHub or GitLab.
 
+The script intentionally does not compile or install Go code.
+
 ## Examples
 
 Download a public Go module through the default Go proxy:
 
-```powershell
-.\Get-GoLibrary.ps1 -Module "github.com/gorilla/mux" -Version "v1.8.1" -Expand
+```bash
+python3 Get-GoLibrary.py --module github.com/gorilla/mux --version v1.8.1 --expand
 ```
 
 Force direct retrieval from GitHub without a module proxy:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -Module "github.com/gorilla/mux" `
-  -Version "v1.8.1" `
-  -Proxy @("direct") `
-  -Expand
+```bash
+python3 Get-GoLibrary.py \
+  --module github.com/gorilla/mux \
+  --version v1.8.1 \
+  --proxy direct \
+  --expand
 ```
 
-Retrieve a module and every dependency listed in the downloaded `go.mod` files:
+Retrieve a module and every dependency listed in downloaded `go.mod` files:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -Module "github.com/aquasecurity/table" `
-  -Version "v1.11.0" `
-  -ResolveDependencies `
-  -Expand
+```bash
+python3 Get-GoLibrary.py \
+  --module github.com/aquasecurity/table \
+  --version v1.11.0 \
+  --resolve-dependencies \
+  --expand
 ```
 
-Retrieve a saved list of packages, resolve the latest versions compatible with
-a target Go version, and export them in static Go proxy layout:
+Retrieve a saved list of packages, resolve latest versions compatible with a
+target Go version, and export them in static Go proxy layout:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -PackageListPath .\go-tools.txt `
-  -GoVersion 1.26.5-1 `
-  -Proxy @("https://proxy.golang.org") `
-  -GoProxyDirectory .\go-proxy-cache
+```bash
+python3 Get-GoLibrary.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1 \
+  --proxy https://proxy.golang.org \
+  --archive-output go-proxy-cache.tar.gz
 ```
 
-`go-tools.txt` can contain bare package names, full package paths, or pinned
-versions:
+Package-list retrieval defaults to static Go proxy output under:
 
 ```text
+./go-proxy-cache
+```
+
+`--archive-output` creates a tar.gz whose contents are the files inside the
+proxy cache root. After transfer, extract it directly into a staging directory
+and upload that directory to Artifactory.
+
+Pass `--go-proxy-directory` only when you want a different proxy cache folder:
+
+```bash
+python3 Get-GoLibrary.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1 \
+  --go-proxy-directory custom-go-proxy-cache
+```
+
+`go-tools.txt` can contain bare package names, full package paths, pinned
+`package@version` entries, `package version` entries, comments, or copied
+`go install package@version` lines:
+
+```text
+# Editor tooling
 gopls
 goimports
 gofumpt
-golangci-lint
-staticcheck
-govulncheck
-gotestsum
+
+# Pinned entries
 golang.org/x/tools/gopls@v0.23.0
 github.com/boumenot/gocover-cobertura v1.5.0
+go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
 ```
 
-Bare entries require `-GoVersion`; the script checks proxy module versions from
-newest to oldest and selects the first version whose `go` directive is
-compatible with the target version. Inputs like `1.26.5-1` are normalized to the
-Go language version `1.26.5`. The resolver first checks versions already present
-in `-GoProxyDirectory`, then probes the upstream proxy's `@latest` endpoint, and
-only falls back to scanning the full version list when latest is not compatible.
-Version lists and compatibility checks are cached within a run so aliases that
-share a module do not repeat the same proxy requests.
+Bare entries require `--go-version`. The resolver normalizes values like
+`1.26.5-1` to the Go language version `1.26.5`, checks existing static proxy
+cache entries first, probes upstream `@latest`, and only scans the full version
+list when latest is not compatible.
 
 Built-in short names currently include:
 
@@ -105,160 +124,68 @@ and exports the owning module, such as `golang.org/x/tools`, so
 
 See `recommended-go-tools.txt` for a starter package list.
 
-Run a random 10-module retrieval test. Dependency resolution is enabled by
-default for this test workflow:
-
-```powershell
-.\Test-GoLibrarySample.ps1 -SampleSize 10 -BatchSize 5
-```
-
-Run the same random sample workflow against direct single-module retrieval only:
-
-```powershell
-.\Test-GoLibrarySample.ps1 -SampleSize 10 -BatchSize 5 -SkipResolveDependencies
-```
-
-Use your own Go proxy chain:
-
-```powershell
-.\Get-GoLibrary.ps1 `
-  -Module "gitlab.example.com/platform/private-lib" `
-  -Version "v1.2.3" `
-  -Proxy @("https://go-proxy.example.com", "direct") `
-  -GitLabToken $env:GITLAB_TOKEN
-```
-
-Fetch directly from a private GitLab project archive:
-
-```powershell
-$env:GITLAB_TOKEN = "glpat-..."
-
-.\Get-GoLibrary.ps1 `
-  -Module "gitlab.example.com/group/subgroup/private-lib" `
-  -Version "v1.2.3" `
-  -Proxy @("direct") `
-  -GitLabHost "gitlab.example.com" `
-  -GitLabProjectPath "group/subgroup/private-lib" `
-  -Expand
-```
-
-## Publishing to Artifactory
-
-After exporting a static proxy tree with `-GoProxyDirectory`, use
-[`artifactory-upload/upload-go-proxy-to-artifactory.sh`](artifactory-upload/upload-go-proxy-to-artifactory.sh)
-to publish the tree into an Artifactory repository through the REST API.
-
-See [`artifactory-upload/README.md`](artifactory-upload/README.md) for
-authentication options, upload ordering details, local testing instructions, and
-Artifactory examples.
-
 ## Output
 
 For package-list retrieval, output defaults to static Go proxy layout under:
 
 ```text
-.\go-proxy-cache
+./go-proxy-cache
 ```
 
-This means the usual package-list command writes durable `.info`, `.mod`,
-`.zip`, and `list` files directly into the folder you can transfer to your
-internal static proxy:
+The usual package-list command writes durable `.info`, `.mod`, `.zip`, and
+`list` files directly into the folder you can transfer to your internal static
+proxy:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -PackageListPath .\go-tools.txt `
-  -GoVersion 1.26.5-1
+```bash
+python3 Get-GoLibrary.py \
+  --package-list-path go-tools.txt \
+  --go-version 1.26.5-1
 ```
 
-Pass `-GoProxyDirectory` only when you want a different proxy-cache folder:
-
-```powershell
-.\Get-GoLibrary.ps1 `
-  -PackageListPath .\go-tools.txt `
-  -GoVersion 1.26.5-1 `
-  -GoProxyDirectory .\custom-go-proxy-cache
-```
-
-For single-module retrieval without `-GoProxyDirectory`, downloads are written
-under:
+For single-module retrieval without `--go-proxy-directory`, downloads are
+written under:
 
 ```text
-.\go-library-cache
+./go-library-cache
 ```
 
-For a single module, pass `-GoProxyDirectory` when you want static proxy output:
+For a single module, pass `--go-proxy-directory` when you want static proxy
+output:
 
-```powershell
-.\Get-GoLibrary.ps1 `
-  -Module "github.com/gorilla/mux" `
-  -Version "v1.8.1" `
-  -GoProxyDirectory .\go-proxy-cache
+```bash
+python3 Get-GoLibrary.py \
+  --module github.com/gorilla/mux \
+  --version v1.8.1 \
+  --go-proxy-directory go-proxy-cache
 ```
 
-When `-GoProxyDirectory` is used without `-OutputDirectory` or `-Expand`, the
-script uses a temporary working cache and removes it after writing the proxy
-tree. Use `-OutputDirectory` when you want to keep the download cache for
+When `--go-proxy-directory` is used without `--output-directory` or `--expand`,
+the script uses a temporary working cache and removes it after writing the proxy
+tree. Use `--output-directory` when you want to keep the download cache for
 debugging, auditing, or expanded source inspection.
 
-The script checks `-GoProxyDirectory` before downloading. If the requested
-module version already has complete `.info`, `.mod`, `.zip`, and `list` entries
-there, it reuses those files and skips upstream proxy calls. Bare package entries
-with `-GoVersion` also check existing proxy-directory versions before asking an
-upstream proxy for `@v/list`.
-
-```powershell
-.\Get-GoLibrary.ps1 `
-  -PackageListPath .\go-tools.txt `
-  -GoVersion 1.26.5-1 `
-  -GoProxyDirectory .\go-proxy-cache `
-  -OutputDirectory .\go-library-cache `
-  -Expand
-```
+The script checks `--go-proxy-directory` before downloading. If the requested
+module version already has complete `.info`, `.mod`, `.zip`, and `list` entries,
+it reuses those files and skips upstream proxy calls.
 
 Module proxy downloads save:
 
 - `version.info`
 - `version.mod`
 - `version.zip`
-- expanded source, when `-Expand` is used
+- expanded source, when `--expand` is used
 
-When `-ResolveDependencies` is used, the script prints a dependency graph
+When `--resolve-dependencies` is used, the script prints a dependency graph
 summary with every retrieved module, root `replace`/`exclude` directives,
 skipped local replacements, and any failures.
 
-For routine tool seeding, leave `-ResolveDependencies` off. A package list of Go
-developer tools should usually export only the command modules needed for
-`go install package@version`. Dependency graph retrieval is intentionally much
-larger and can take a long time behind an internal proxy or inspection gateway;
-use it only when you are deliberately trying to pre-seed the full transitive
-module closure for an air-gapped install path.
+For routine tool seeding, leave `--resolve-dependencies` off. A package list of
+Go developer tools should usually export only the command modules needed for
+`go install package@version`. Dependency graph retrieval is much larger and can
+take a long time behind an internal proxy or inspection gateway; use it only
+when intentionally pre-seeding the full transitive module closure.
 
-The dependency graph summary includes:
-
-- `RetrievedCount`: every module version downloaded.
-- `SelectedCount`: the selected module set after highest-version selection.
-- `SupersededCount`: downloaded module versions that were superseded by a newer
-  version of the same module.
-- `FailureCount`: modules that could not be retrieved.
-- `SkippedCount`: modules intentionally skipped, such as local path
-  replacements that cannot be fetched over HTTP.
-
-`Test-GoLibrarySample.ps1` writes:
-
-- `sample.json`: the randomly selected modules.
-- `results.json`: one row per sampled module.
-- `summary.json`: success/failure counts, batch counts, and failed module
-  details.
-- one `.log` file per sampled module.
-
-The script prints a JSON summary containing the paths it wrote.
-
-Progress messages are written to stderr with a `[go-fetch]` prefix so stdout can
-remain valid JSON for automation. During package-list runs, those messages show
-when each package is resolved, retrieved, reused from the static proxy cache, and
-exported.
-
-## Installing Tools From The Static Proxy
+## Static Proxy Transfer
 
 After transferring `go-proxy-cache` into your internal static proxy, Go clients
 can install command packages directly:
@@ -268,26 +195,44 @@ go env -w GOPROXY=https://goproxy.internal.example.com
 go env -w GOSUMDB=off
 
 go install golang.org/x/tools/gopls@v0.23.0
-go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
 ```
 
-The package path used with `go install` may be deeper than the module path stored
-in the proxy. That is expected. The Go command resolves the package to its owning
-module and then fetches that module's `.info`, `.mod`, and `.zip` files from the
-proxy.
+Use `GOSUMDB=off` only for isolated environments that cannot reach the public
+checksum database. If you run an internal checksum database, point `GOSUMDB` at
+that instead.
 
-## Authentication Notes
+## Artifactory
 
-- GitLab source archives use `-GitLabToken` or `$env:GITLAB_TOKEN`.
-- GitHub source archives use `-GitHubToken` or `$env:GITHUB_TOKEN`.
+After exporting a static proxy tree or transfer archive, use
+[`artifactory-upload/upload-go-proxy-to-artifactory.sh`](artifactory-upload/upload-go-proxy-to-artifactory.sh)
+to publish it into an Artifactory repository.
 
-## Limitations
+```bash
+mkdir -p /tmp/go-proxy-cache
+tar -xzf go-proxy-cache.tar.gz -C /tmp/go-proxy-cache
 
-- This does not run `go mod tidy`, compile packages, or resolve every transitive
-  dependency exactly the way the Go command does. `-ResolveDependencies` follows
-  `require` directives from downloaded `go.mod` files and honors the root
-  module's `replace` and `exclude` directives, but it does not evaluate build
-  tags, package imports, workspace files, vendoring, checksum database
-  verification, or module graph pruning with full Go command fidelity.
-- Direct VCS retrieval is implemented for GitHub and GitLab REST archives, not
-  arbitrary Git servers.
+ARTIFACTORY_TOKEN=... ./artifactory-upload/upload-go-proxy-to-artifactory.sh \
+  --source-dir /tmp/go-proxy-cache \
+  --artifactory-url https://artifactory.example.com/artifactory \
+  --repo go-local
+```
+
+See [`artifactory-upload/README.md`](artifactory-upload/README.md) for
+authentication options, upload ordering details, local testing instructions, and
+Artifactory examples.
+
+## Local Smoke Test
+
+The smoke test uses local Python HTTP servers and the local Go command. It does
+not require PowerShell.
+
+```bash
+./tests/smoke-static-goproxy.sh
+./tests/smoke-goproxy-artifactory-e2e.sh
+```
+
+The first test verifies static proxy output can be consumed by `go`. The second
+test verifies the full handoff flow: download, tar, extract, upload to a local
+Artifactory-style endpoint, then consume that endpoint with `go mod download`
+and `go install package@version`.

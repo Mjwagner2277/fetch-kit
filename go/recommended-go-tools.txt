@@ -1,5 +1,5 @@
 # Common Go development tools.
-# Bare names use aliases in Get-GoLibrary.ps1 and require -GoVersion.
+# Bare names use aliases in Get-GoLibrary.py and require --go-version.
 
 # Editor and language tooling
 gopls

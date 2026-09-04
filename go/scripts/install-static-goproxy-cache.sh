@@ -6,7 +6,7 @@ usage() {
 Usage:
   install-static-goproxy-cache.sh [--no-sudo] SOURCE_DIR [DEST_DIR]
 
-Copies a static Go proxy cache exported by Get-GoLibrary.ps1 -GoProxyDirectory
+Copies a static Go proxy cache exported by Get-GoLibrary.py --go-proxy-directory
 into an existing static Go proxy root and validates the Go proxy protocol files.
 Files are merged additively; existing modules are not deleted.
 

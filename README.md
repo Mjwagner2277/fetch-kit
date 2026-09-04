@@ -1,6 +1,6 @@
 # Fetch Kit
 
-PowerShell-first retrieval scripts for constrained or air-gapped environments
+Portable retrieval scripts for constrained or air-gapped environments
 where the usual toolchain is unavailable, restricted, or intentionally avoided.
 
 The goal is to fetch source, module metadata, and OCI-style artifacts with
@@ -9,7 +9,8 @@ container CLIs.
 
 ## Contents
 
-- `go/` - Go module and dependency retrieval without invoking the Go toolchain.
+- `go/` - Python Go module and dependency retrieval without invoking the Go
+  toolchain.
 - `iso/` - ISO-9660/Joliet short-hash file manifests and visible RPM metadata
   without mounting the ISO.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
