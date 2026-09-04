@@ -209,40 +209,6 @@ node upload-npm-artifactory-bundle.js \
   --work-dir ./upload-work
 ```
 
-## Local Artifactory Test
-
-The local integration test verifies the real Artifactory/npm behavior that the
-fake-npm test cannot prove:
-
-- publish a higher version first directly to Artifactory
-- upload a transfer tar containing lower and prerelease versions
-- confirm the uploader does not move `latest` backward
-- confirm a new package in the same bundle does get `latest` on its highest
-  stable version
-
-Run it against a local Artifactory instance:
-
-```bash
-ARTIFACTORY_URL=http://localhost:8082/artifactory \
-ARTIFACTORY_USERNAME=admin \
-ARTIFACTORY_PASSWORD=password \
-  node npm/tests/integration-local-artifactory-upload.js
-```
-
-Or point it at an existing npm repository:
-
-```bash
-ARTIFACTORY_NPM_REGISTRY="https://art.example.com/artifactory/api/npm/npm-local/" \
-ARTIFACTORY_TOKEN="$ARTIFACTORY_TOKEN" \
-  node npm/tests/integration-local-artifactory-upload.js
-```
-
-If `ARTIFACTORY_NPM_REGISTRY` is not set, the test creates a temporary local npm
-repo and deletes it afterward. That requires an Artifactory edition that
-supports npm repositories and a user with repository management permission.
-Artifactory OSS does not support npm repositories, so the test exits `77` as a
-skip in that case.
-
 ## State Behavior
 
 There is one state file per target Node.js version. Every run updates that
