@@ -15,13 +15,16 @@ Usage:
 
 Examples:
   node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 react lodash
+  node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 react@18.2.0
   node npm/download-npm-artifactory-bundle.js --node-version 18.20.4 --package @storybook/test-runner
+  node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 --packages-file packages.txt
   node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 --update-all
 
 Options:
   --node-version VERSION       Target Node.js version for engine checks. Required.
   --package SPEC              Package spec to add. May be repeated.
-  --packages-file FILE        Newline text file or JSON array of package specs.
+  --packages-file FILE        Package list file. May be repeated.
+  --package-file FILE         Alias for --packages-file.
   --update-all                Re-download every package recorded in this node-version state file.
   --registry URL              Source npm registry. Defaults to npm's configured registry.
   --userconfig FILE           npmrc file for source registry auth.
@@ -63,7 +66,7 @@ function parseArgs(argv) {
   const options = {
     nodeVersion: '',
     packages: [],
-    packagesFile: '',
+    packagesFiles: [],
     updateAll: false,
     registry: '',
     userconfig: '',
@@ -106,7 +109,8 @@ function parseArgs(argv) {
         options.packages.push(next());
         break;
       case '--packages-file':
-        options.packagesFile = next();
+      case '--package-file':
+        options.packagesFiles.push(next());
         break;
       case '--update-all':
         options.updateAll = true;
@@ -233,6 +237,82 @@ function splitPackageSpec(spec) {
   return { name: trimmed, requested: 'latest', spec: `${trimmed}@latest` };
 }
 
+function packageSpecFromNameVersion(name, version, source) {
+  const cleanName = String(name || '').trim();
+  const cleanVersion = version === undefined || version === null ? '' : String(version).trim();
+  if (!cleanName) {
+    fail(`Package entry in ${source} is missing a package name`);
+  }
+  return cleanVersion ? `${cleanName}@${cleanVersion}` : cleanName;
+}
+
+function packageSpecFromTextLine(line, source) {
+  const trimmed = String(line || '').replace(/#.*/, '').trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  const comma = trimmed.match(/^([^,\s]+)\s*,\s*(.+)$/);
+  if (comma) {
+    return packageSpecFromNameVersion(comma[1], comma[2], source);
+  }
+
+  const parts = trimmed.split(/\s+/);
+  if (parts.length > 1) {
+    return packageSpecFromNameVersion(parts[0], parts.slice(1).join(' '), source);
+  }
+
+  return trimmed;
+}
+
+function packageSpecsFromDependencyMap(map, source) {
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    fail(`Package dependency map in ${source} must be an object`);
+  }
+  return Object.entries(map).map(([name, version]) => packageSpecFromNameVersion(name, version, source));
+}
+
+function packageSpecFromJsonEntry(item, source) {
+  if (typeof item === 'string') {
+    return packageSpecFromTextLine(item, source);
+  }
+  if (item && typeof item === 'object' && !Array.isArray(item)) {
+    if (item.spec) {
+      return packageSpecFromTextLine(String(item.spec), source);
+    }
+    if (item.name) {
+      const version = item.version ?? item.requested ?? item.range ?? item.tag ?? '';
+      return packageSpecFromNameVersion(item.name, version, source);
+    }
+  }
+  fail(`Unsupported package entry in ${source}`);
+}
+
+function packageSpecsFromJson(value, source) {
+  if (Array.isArray(value)) {
+    return value.map((item) => packageSpecFromJsonEntry(item, source)).filter(Boolean);
+  }
+
+  if (value && typeof value === 'object') {
+    if (Array.isArray(value.packages)) {
+      return value.packages.map((item) => packageSpecFromJsonEntry(item, source)).filter(Boolean);
+    }
+    if (value.packages && typeof value.packages === 'object') {
+      return packageSpecsFromDependencyMap(value.packages, source);
+    }
+    if (value.dependencies && typeof value.dependencies === 'object') {
+      return packageSpecsFromDependencyMap(value.dependencies, source);
+    }
+
+    const entries = Object.entries(value);
+    if (entries.length > 0 && entries.every(([, version]) => ['string', 'number'].includes(typeof version))) {
+      return packageSpecsFromDependencyMap(value, source);
+    }
+  }
+
+  fail(`--packages-file JSON must be an array, {"packages":[...]}, {"packages":{...}}, or a dependency map`);
+}
+
 function readPackagesFile(file) {
   if (!file) {
     return [];
@@ -240,28 +320,14 @@ function readPackagesFile(file) {
 
   const fullPath = path.resolve(file);
   const text = fs.readFileSync(fullPath, 'utf8');
-  if (fullPath.endsWith('.json')) {
-    const parsed = JSON.parse(text);
-    if (!Array.isArray(parsed)) {
-      fail('--packages-file JSON must be an array');
-    }
-    return parsed.map((item) => {
-      if (typeof item === 'string') {
-        return item;
-      }
-      if (item && typeof item === 'object' && item.spec) {
-        return String(item.spec);
-      }
-      if (item && typeof item === 'object' && item.name) {
-        return item.version ? `${item.name}@${item.version}` : String(item.name);
-      }
-      fail(`Unsupported package entry in ${fullPath}`);
-    });
+  const trimmed = text.trim();
+  if (fullPath.endsWith('.json') || trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    return packageSpecsFromJson(JSON.parse(text), fullPath);
   }
 
   return text
     .split(/\r?\n/)
-    .map((line) => line.replace(/#.*/, '').trim())
+    .map((line) => packageSpecFromTextLine(line, fullPath))
     .filter(Boolean);
 }
 
@@ -885,7 +951,10 @@ function main() {
     fail('--node-version is required');
   }
 
-  const packageSpecs = [...options.packages, ...readPackagesFile(options.packagesFile)];
+  const packageSpecs = [
+    ...options.packagesFiles.flatMap((file) => readPackagesFile(file)),
+    ...options.packages
+  ];
   mkdirp(options.stateDir);
   mkdirp(options.outputDir);
 

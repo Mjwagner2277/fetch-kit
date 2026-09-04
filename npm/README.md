@@ -20,6 +20,22 @@ node npm/download-npm-artifactory-bundle.js \
   @storybook/test-runner
 ```
 
+Download one exact package version for a target Node.js version:
+
+```bash
+node npm/download-npm-artifactory-bundle.js \
+  --node-version 20.11.1 \
+  react@18.2.0
+```
+
+Download a package list for a target Node.js version:
+
+```bash
+node npm/download-npm-artifactory-bundle.js \
+  --node-version 20.11.1 \
+  --packages-file packages-node-20.txt
+```
+
 Download everything already recorded for that same Node.js version:
 
 ```bash
@@ -37,6 +53,47 @@ node npm/download-npm-artifactory-bundle.js \
   --token "$NPM_TOKEN" \
   @company/app
 ```
+
+## Package Input Files
+
+Use `--packages-file` or `--package-file` to load requested root packages from
+a file. The flag may be repeated, and file entries can be combined with
+positional package arguments or repeated `--package` arguments.
+If the same package name appears more than once, the last request wins; CLI
+package arguments are applied after package files.
+
+Plain text files support blank lines and `#` comments:
+
+```text
+react
+lodash@4.17.21
+@storybook/test-runner
+express 4.18.2
+@protobuf-ts/runtime 2.9.4
+```
+
+JSON package lists are also supported:
+
+```json
+[
+  "react",
+  "lodash@4.17.21",
+  { "name": "@protobuf-ts/runtime", "version": "2.9.4" }
+]
+```
+
+You can also use a simple dependency map:
+
+```json
+{
+  "react": "18.2.0",
+  "@protobuf-ts/runtime": "2.9.4"
+}
+```
+
+Unversioned entries are recorded as `latest` requests in the state file and are
+resolved to the newest version compatible with the supplied `--node-version`.
+Versioned entries stay pinned or ranged exactly as requested.
 
 Upload the transfer tar from the airgapped environment:
 
