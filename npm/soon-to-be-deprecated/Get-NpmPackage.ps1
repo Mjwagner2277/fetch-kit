@@ -587,7 +587,9 @@ function Write-ArtifactoryBundle {
     $summaryFile = Join-Path $bundleRoot 'retrieval-summary.json'
     $readmeFile = Join-Path $bundleRoot 'README.txt'
     $bashPublishScript = Join-Path $bundleRoot 'publish-npm-package-bundle.sh'
+    $bashUploadScript = Join-Path $bundleRoot 'upload-npm-tarballs-to-artifactory.sh'
     $sourceBashPublishScript = Join-Path $PSScriptRoot 'publish-npm-package-bundle.sh'
+    $sourceBashUploadScript = Join-Path $PSScriptRoot 'upload-npm-tarballs-to-artifactory.sh'
 
     $manifestItems | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestFile -Encoding UTF8
     $Summary | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $summaryFile -Encoding UTF8
@@ -601,6 +603,9 @@ function Write-ArtifactoryBundle {
     if (Test-Path -LiteralPath $sourceBashPublishScript) {
         Copy-Item -LiteralPath $sourceBashPublishScript -Destination $bashPublishScript -Force
     }
+    if (Test-Path -LiteralPath $sourceBashUploadScript) {
+        Copy-Item -LiteralPath $sourceBashUploadScript -Destination $bashUploadScript -Force
+    }
 
     @(
         'npm Artifactory upload bundle',
@@ -610,12 +615,16 @@ function Write-ArtifactoryBundle {
         'Publish from a Linux airgapped asset with:',
         '  ./publish-npm-package-bundle.sh --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" --token "$ARTIFACTORY_TOKEN" --skip-existing',
         '',
+        'By default, publishing removes scripts and devDependencies from each tarball package.json and repacks with tar.',
+        'This keeps runtime library fields and dependencies while avoiding missing build/test/lifecycle packages offline.',
+        '',
         'Files:',
         '  packages.json             Machine-readable publish manifest.',
         '  packages.tsv              Human-readable package list.',
         '  retrieval-summary.json    Original resolver output.',
         '  tarballs/                 Flat publish-ready npm .tgz files.',
-        '  publish-npm-package-bundle.sh  Bash offline publishing helper.'
+        '  publish-npm-package-bundle.sh  Bash offline publishing helper.',
+        '  upload-npm-tarballs-to-artifactory.sh  Shared npm tarball uploader.'
     ) | Set-Content -LiteralPath $readmeFile -Encoding UTF8
 
     return [pscustomobject]@{

@@ -31,6 +31,12 @@ Optional environment variables:
                                 Defaults to true.
   INCLUDE_PACKAGE_REGEX         Only mirror package names matching this regex
   EXCLUDE_PACKAGE_REGEX         Skip package names matching this regex
+  NORMALIZE_LIBRARY_PACKAGE     true to rewrite tarball package.json before
+                                upload. Defaults to true.
+  STRIP_PEER_DEPENDENCIES       true to remove peerDependencies during
+                                normalization. Defaults to false.
+  STRIP_OPTIONAL_DEPENDENCIES   true to remove optionalDependencies during
+                                normalization. Defaults to false.
   NPM_FLAGS                     Extra flags appended to npm pack and npm publish
 
 Examples:
@@ -206,6 +212,7 @@ list_gitlab_npm_packages() {
   done
 
   sort -u "$output_file" -o "$output_file"
+  sort -t $'\t' -k1,1 -k2,2V "$output_file" -o "$output_file"
 }
 
 write_version_inventory() {
@@ -310,38 +317,6 @@ pack_from_gitlab() {
   printf '%s/%s\n' "$TARBALL_DIR" "$filename"
 }
 
-publish_to_artifactory() {
-  local tarball="$1"
-  local package_ref="$2"
-  local publish_log="${WORK_DIR}/publish.log"
-  PUBLISH_RESULT="published"
-
-  log "Publishing ${package_ref} to Artifactory"
-  set +e
-  npm publish "$tarball" \
-    --registry "$ARTIFACTORY_NPM_REGISTRY" \
-    --userconfig "$NPMRC" \
-    --ignore-scripts \
-    ${NPM_FLAGS:-} >"$publish_log" 2>&1
-  local exit_code=$?
-  set -e
-
-  if [[ "$exit_code" -eq 0 ]]; then
-    PUBLISH_RESULT="published"
-    return 0
-  fi
-
-  if is_true "${SKIP_EXISTING:-true}" && grep -Eiq 'EPUBLISHCONFLICT|already exists|already present|cannot publish over|409|conflict' "$publish_log"; then
-    log "Skipping existing package ${package_ref}"
-    PUBLISH_RESULT="skipped-existing"
-    return 0
-  fi
-
-  PUBLISH_RESULT="failed"
-  sed 's/^/[npm publish] /' "$publish_log" >&2
-  return "$exit_code"
-}
-
 write_result() {
   local status="$1"
   local package_name="$2"
@@ -395,7 +370,13 @@ main() {
 
   GITLAB_PACKAGE_STATUS="${GITLAB_PACKAGE_STATUS:-default}"
   DRY_RUN_SIZE="${DRY_RUN_SIZE:-true}"
+  NORMALIZE_LIBRARY_PACKAGE="${NORMALIZE_LIBRARY_PACKAGE:-true}"
+  STRIP_PEER_DEPENDENCIES="${STRIP_PEER_DEPENDENCIES:-false}"
+  STRIP_OPTIONAL_DEPENDENCIES="${STRIP_OPTIONAL_DEPENDENCIES:-false}"
   build_gitlab_urls
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  UPLOAD_SCRIPT="${SCRIPT_DIR}/upload-npm-tarballs-to-artifactory.sh"
+  [[ -x "$UPLOAD_SCRIPT" ]] || fail "Upload script not found or not executable: $UPLOAD_SCRIPT"
 
   if [[ -z "${WORK_DIR:-}" ]]; then
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gitlab-npm-artifactory.XXXXXX")"
@@ -408,10 +389,14 @@ main() {
   NPMRC="${WORK_DIR}/npmrc"
   PACKAGE_LIST="${WORK_DIR}/gitlab-npm-packages.tsv"
   VERSION_COUNTS_FILE="${WORK_DIR}/gitlab-npm-version-counts.tsv"
+  UPLOAD_MANIFEST="${WORK_DIR}/gitlab-npm-upload-manifest.tsv"
+  UPLOAD_WORK_DIR="${WORK_DIR}/artifactory-upload"
+  UPLOAD_SUMMARY_JSON="${WORK_DIR}/artifactory-upload-summary.json"
   RESULTS_JSONL="${WORK_DIR}/results.jsonl"
   SUMMARY_JSON="${WORK_DIR}/summary.json"
   : >"$NPMRC"
   : >"$RESULTS_JSONL"
+  : >"$UPLOAD_MANIFEST"
 
   if ! is_true "${KEEP_WORK_DIR:-false}"; then
     trap 'rm -rf "$WORK_DIR"' EXIT
@@ -444,9 +429,9 @@ main() {
   local skipped=0
   local skipped_existing=0
   local failed=0
+  local packed=0
   local size_known_total=0
   local size_unknown_count=0
-  PUBLISH_RESULT=""
 
   while IFS=$'\t' read -r package_name package_version package_id project_id delete_api_path; do
     [[ -n "$package_name" ]] || continue
@@ -490,18 +475,12 @@ main() {
 
     local tarball=""
     local error_message=""
-    if tarball="$(pack_from_gitlab "$package_name" "$package_version")" &&
-       publish_to_artifactory "$tarball" "$package_ref"; then
-      if [[ "$PUBLISH_RESULT" == "skipped-existing" ]]; then
-        skipped_existing=$((skipped_existing + 1))
-        write_result skipped-existing "$package_name" "$package_version" "$package_id" "$tarball" ""
-      else
-        mirrored=$((mirrored + 1))
-        write_result mirrored "$package_name" "$package_version" "$package_id" "$tarball" ""
-      fi
+    if tarball="$(pack_from_gitlab "$package_name" "$package_version")"; then
+      packed=$((packed + 1))
+      printf '%s\t%s\t%s\t%s\n' "$package_name" "$package_version" "$tarball" "$package_id" >>"$UPLOAD_MANIFEST"
     else
       failed=$((failed + 1))
-      error_message="Failed to mirror ${package_ref}"
+      error_message="Failed to pack ${package_ref}"
       log "$error_message"
       write_result failed "$package_name" "$package_version" "$package_id" "$tarball" "$error_message"
       if ! is_true "${CONTINUE_ON_ERROR:-true}"; then
@@ -509,6 +488,58 @@ main() {
       fi
     fi
   done <"$PACKAGE_LIST"
+
+  if [[ "$packed" -gt 0 ]]; then
+    upload_args=(
+      "$UPLOAD_SCRIPT"
+      --manifest "$UPLOAD_MANIFEST"
+      --registry-url "$ARTIFACTORY_NPM_REGISTRY"
+      --work-dir "$UPLOAD_WORK_DIR"
+    )
+    if [[ -n "${ARTIFACTORY_TOKEN:-}" ]]; then
+      upload_args+=(--token "$ARTIFACTORY_TOKEN")
+    else
+      upload_args+=(--username "$ARTIFACTORY_USERNAME" --password "$ARTIFACTORY_PASSWORD")
+    fi
+    if is_true "${SKIP_EXISTING:-true}"; then
+      upload_args+=(--skip-existing)
+    fi
+    if is_true "$NORMALIZE_LIBRARY_PACKAGE"; then
+      upload_args+=(--normalize-library-package)
+    else
+      upload_args+=(--no-normalize-library-package)
+    fi
+    if is_true "$STRIP_PEER_DEPENDENCIES"; then
+      upload_args+=(--strip-peer-dependencies)
+    fi
+    if is_true "$STRIP_OPTIONAL_DEPENDENCIES"; then
+      upload_args+=(--strip-optional-dependencies)
+    fi
+    if [[ -n "${NPM_FLAGS:-}" ]]; then
+      upload_args+=(--npm-flags "$NPM_FLAGS")
+    fi
+
+    set +e
+    "${upload_args[@]}" >"$UPLOAD_SUMMARY_JSON"
+    upload_exit_code=$?
+    set -e
+
+    if [[ -f "$UPLOAD_SUMMARY_JSON" ]]; then
+      mirrored="$(jq '.published' "$UPLOAD_SUMMARY_JSON")"
+      skipped_existing="$(jq '.skipped_existing' "$UPLOAD_SUMMARY_JSON")"
+      upload_failed="$(jq '.failed' "$UPLOAD_SUMMARY_JSON")"
+      failed=$((failed + upload_failed))
+      jq -c '.results[] |
+        {status:(if .status == "published" then "mirrored" else .status end),
+         package:.package, version:.version, gitlab_package_id:"", tarball:.tarball,
+         size_bytes:0, size_known:false, file_count:0, package_files_url:"",
+         dist_tag:.dist_tag, error:.error}' "$UPLOAD_SUMMARY_JSON" >>"$RESULTS_JSONL"
+    fi
+
+    if [[ "$upload_exit_code" -ne 0 && ! -f "$UPLOAD_SUMMARY_JSON" ]]; then
+      fail "Artifactory upload failed before writing a summary"
+    fi
+  fi
 
   if is_true "${DRY_RUN:-false}" && is_true "$DRY_RUN_SIZE"; then
     log "DRY_RUN total known package file size: $(format_bytes "$size_known_total") (${size_known_total} bytes)"
@@ -525,6 +556,8 @@ main() {
     --arg artifactory_registry "$ARTIFACTORY_NPM_REGISTRY" \
     --arg work_dir "$WORK_DIR" \
     --arg version_counts_file "$VERSION_COUNTS_FILE" \
+    --arg upload_manifest "$UPLOAD_MANIFEST" \
+    --arg upload_summary_file "$UPLOAD_SUMMARY_JSON" \
     --argjson discovered "$discovered" \
     --argjson distinct_packages "$distinct_packages" \
     --argjson multi_version_packages "$multi_version_packages" \
@@ -538,7 +571,8 @@ main() {
     --argjson dry_run_unknown_size_count "$size_unknown_count" \
     '{gitlab_url:$gitlab_url, gitlab_scope_type:$gitlab_scope_type, gitlab_scope_id:$gitlab_scope_id,
       gitlab_registry:$gitlab_registry, artifactory_registry:$artifactory_registry, work_dir:$work_dir,
-      version_counts_file:$version_counts_file,
+      version_counts_file:$version_counts_file, upload_manifest:$upload_manifest,
+      upload_summary_file:$upload_summary_file,
       discovered:$discovered, distinct_packages:$distinct_packages,
       multi_version_packages:$multi_version_packages,
       selected:$total, mirrored:$mirrored, skipped:$skipped, failed:$failed,

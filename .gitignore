@@ -15,5 +15,7 @@ metadata-cache/
 npm-package-cache/
 npm-package-cache-sample/
 npm-airgap-cache/
+npm-artifactory-cache/
+npm-state/
 npm/**/sample-results/
 npm/**/artifactory-upload/
