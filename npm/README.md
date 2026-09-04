@@ -44,8 +44,7 @@ Upload the transfer tar from the airgapped environment:
 node upload-npm-artifactory-bundle.js \
   --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
   --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
-  --token "$ARTIFACTORY_TOKEN" \
-  --skip-existing
+  --token "$ARTIFACTORY_TOKEN"
 ```
 
 ## Output
@@ -108,7 +107,9 @@ Required upload inputs:
 - authentication via `--token`, `--username`/`--password`, or `--userconfig`.
 
 The uploader always passes an explicit npm dist-tag. It does not rely on
-`npm publish` defaults.
+`npm publish` defaults. It also treats already-published versions as success by
+default so reruns of large bundles can continue making progress. Use
+`--no-skip-existing` for strict conflict handling.
 
 Default `latest` handling uses `--latest-policy computed`:
 
@@ -124,9 +125,11 @@ That means if Artifactory already has `some-lib@3.0.0`, and the transfer tar
 contains `some-lib@2.0.0`, the uploader publishes `2.0.0` with
 `airgap-2.0.0`, not `latest`.
 
-If Artifactory version lookup fails, the default policy fails the run so it
-does not accidentally move `latest` backwards. Use `--latest-policy never` when
-you want to avoid `latest` tags entirely.
+If Artifactory version lookup fails for one package, the default policy avoids
+`latest` for that package and continues with the rest of the bundle. That keeps
+the upload fail-closed for tag safety while maximizing progress on large sets.
+Use `--fail-on-remote-query-error` for strict lookup handling, or
+`--latest-policy never` when you want to avoid `latest` tags entirely.
 
 Dry-run example:
 
@@ -136,6 +139,17 @@ node upload-npm-artifactory-bundle.js \
   --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
   --token "$ARTIFACTORY_TOKEN" \
   --dry-run
+```
+
+For large uploads, provide a durable work directory so `upload-results.json`,
+`upload-results.jsonl`, and `npm-publish.log` remain available:
+
+```bash
+node upload-npm-artifactory-bundle.js \
+  --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --token "$ARTIFACTORY_TOKEN" \
+  --work-dir ./upload-work
 ```
 
 ## Local Artifactory Test

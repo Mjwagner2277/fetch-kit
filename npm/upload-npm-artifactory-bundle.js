@@ -22,10 +22,16 @@ Options:
   --password PASSWORD        Artifactory password/API key. Defaults to ARTIFACTORY_PASSWORD.
   --work-dir DIR             Working directory for extraction, npmrc, logs, and summaries.
   --keep-work-dir            Keep a temporary work directory after completion.
-  --skip-existing            Treat already-published versions as success.
+  --skip-existing            Treat already-published versions as success. Default.
+  --no-skip-existing         Treat already-published versions as failures.
   --dry-run                  Query Artifactory and print planned publish actions.
   --latest-policy POLICY     computed, never, or force-computed. Defaults to computed.
+  --fail-on-remote-query-error
+                             Fail if Artifactory versions cannot be queried.
+                             Default is to avoid latest for that package and continue.
   --tag-prefix PREFIX        Prefix for non-latest dist-tags. Defaults to airgap-.
+  --publish-retries N        Retries after a failed publish attempt. Defaults to 2.
+  --retry-delay-ms N         Delay between publish retries. Defaults to 1000.
   --npm-bin PATH             npm executable. Defaults to npm.
   --npm-flags FLAGS          Extra flags appended to npm publish.
   -h, --help                 Show this help.
@@ -34,6 +40,8 @@ latest-policy:
   computed        Query Artifactory versions for every package. An incoming stable
                   version only gets latest if it is the highest stable version
                   across both Artifactory and the incoming bundle.
+                  If lookup fails for one package, avoid latest for that package
+                  and continue unless --fail-on-remote-query-error is set.
   never           Never publish with latest. Every version gets PREFIX<version>.
   force-computed  Compute latest from the incoming bundle only. This can move
                   latest backwards if Artifactory already has a newer version.
@@ -59,10 +67,13 @@ function parseArgs(argv) {
     password: process.env.ARTIFACTORY_PASSWORD || '',
     workDir: '',
     keepWorkDir: false,
-    skipExisting: false,
+    skipExisting: true,
     dryRun: false,
     latestPolicy: 'computed',
+    failOnRemoteQueryError: false,
     tagPrefix: 'airgap-',
+    publishRetries: 2,
+    retryDelayMs: 1000,
     npmBin: process.env.NPM_BIN || 'npm',
     npmFlags: process.env.NPM_FLAGS || ''
   };
@@ -112,14 +123,26 @@ function parseArgs(argv) {
       case '--skip-existing':
         options.skipExisting = true;
         break;
+      case '--no-skip-existing':
+        options.skipExisting = false;
+        break;
       case '--dry-run':
         options.dryRun = true;
         break;
       case '--latest-policy':
         options.latestPolicy = next();
         break;
+      case '--fail-on-remote-query-error':
+        options.failOnRemoteQueryError = true;
+        break;
       case '--tag-prefix':
         options.tagPrefix = next();
+        break;
+      case '--publish-retries':
+        options.publishRetries = Number.parseInt(next(), 10);
+        break;
+      case '--retry-delay-ms':
+        options.retryDelayMs = Number.parseInt(next(), 10);
         break;
       case '--npm-bin':
         options.npmBin = next();
@@ -137,6 +160,12 @@ function parseArgs(argv) {
   }
   if (!options.tagPrefix || !/^[A-Za-z][A-Za-z0-9._-]*$/.test(options.tagPrefix)) {
     fail('--tag-prefix must start with a letter and contain only letters, numbers, dots, underscores, or hyphens');
+  }
+  if (!Number.isInteger(options.publishRetries) || options.publishRetries < 0) {
+    fail('--publish-retries must be a non-negative integer');
+  }
+  if (!Number.isInteger(options.retryDelayMs) || options.retryDelayMs < 0) {
+    fail('--retry-delay-ms must be a non-negative integer');
   }
 
   return options;
@@ -290,6 +319,13 @@ function splitNpmFlags(flags) {
   }
   return String(flags).match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)
     .map((part) => part.replace(/^['"]|['"]$/g, ''));
+}
+
+function sleep(ms) {
+  if (ms <= 0) {
+    return;
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function extractBundle(options, workDir) {
@@ -446,18 +482,45 @@ function buildTagPlan(packages, options) {
       log(`Querying Artifactory versions for ${packageName}`);
       const remote = npmViewVersions(packageName, options);
       if (!remote.ok) {
-        fail(`Could not query Artifactory versions for ${packageName}. Use --latest-policy never to avoid latest tags, or fix the registry query.\n${remote.error}`);
+        if (options.failOnRemoteQueryError) {
+          fail(`Could not query Artifactory versions for ${packageName}. Use --latest-policy never to avoid latest tags, or fix the registry query.\n${remote.error}`);
+        }
+        remoteByPackage[packageName] = {
+          versions: [],
+          notFound: false,
+          queryOk: false,
+          error: remote.error,
+          latestProtected: true
+        };
+        for (const pkg of group) {
+          plan.set(`${pkg.name}@${pkg.version}`, {
+            distTag: mirrorTagForVersion(pkg.version, options.tagPrefix),
+            latestReason: 'remote-query-failed-avoid-latest',
+            highestStableVersion: '',
+            remoteVersionCount: 0,
+            remoteHasNewerStable: false,
+            remoteQueryOk: false,
+            remoteQueryError: remote.error
+          });
+        }
+        continue;
       }
       remoteVersions = remote.versions;
       remoteByPackage[packageName] = {
         versions: remoteVersions,
-        notFound: Boolean(remote.notFound)
+        notFound: Boolean(remote.notFound),
+        queryOk: true,
+        error: '',
+        latestProtected: false
       };
     } else {
       remoteByPackage[packageName] = {
         versions: [],
         notFound: false,
-        skipped: options.latestPolicy !== 'computed'
+        queryOk: true,
+        error: '',
+        skipped: options.latestPolicy !== 'computed',
+        latestProtected: false
       };
     }
 
@@ -485,7 +548,9 @@ function buildTagPlan(packages, options) {
         latestReason,
         highestStableVersion: highest,
         remoteVersionCount: remoteVersions.length,
-        remoteHasNewerStable: Boolean(highest && compareSemver(highest, pkg.version) > 0)
+        remoteHasNewerStable: Boolean(highest && compareSemver(highest, pkg.version) > 0),
+        remoteQueryOk: true,
+        remoteQueryError: ''
       });
     }
   }
@@ -504,20 +569,27 @@ function publishPackage(pkg, tag, options, publishLog) {
     ...splitNpmFlags(options.npmFlags)
   ];
 
-  const result = run(options.npmBin, args);
-  fs.appendFileSync(publishLog, `${result.stdout || ''}${result.stderr || ''}\n`);
+  let lastOutput = '';
+  for (let attempt = 0; attempt <= options.publishRetries; attempt += 1) {
+    const result = run(options.npmBin, args);
+    lastOutput = `${result.stdout || ''}${result.stderr || ''}`;
+    fs.appendFileSync(publishLog, `[attempt ${attempt + 1}] ${pkg.name}@${pkg.version} tag=${tag}\n${lastOutput}\n`);
 
-  if (result.status === 0) {
-    return { status: 'published', output: result.stdout || '' };
+    if (result.status === 0) {
+      return { status: 'published', output: result.stdout || '', attempts: attempt + 1 };
+    }
+
+    if (options.skipExisting &&
+        /EPUBLISHCONFLICT|already exists|already present|cannot publish over|409|conflict/i.test(lastOutput)) {
+      return { status: 'skipped-existing', output: lastOutput, attempts: attempt + 1 };
+    }
+
+    if (attempt < options.publishRetries) {
+      sleep(options.retryDelayMs);
+    }
   }
 
-  const output = `${result.stdout || ''}${result.stderr || ''}`;
-  if (options.skipExisting &&
-      /EPUBLISHCONFLICT|already exists|already present|cannot publish over|409|conflict/i.test(output)) {
-    return { status: 'skipped-existing', output };
-  }
-
-  return { status: 'failed', output };
+  return { status: 'failed', output: lastOutput, attempts: options.publishRetries + 1 };
 }
 
 function writeResult(resultsJsonl, result) {
@@ -572,7 +644,10 @@ function main() {
         distTag: tag.distTag,
         latestReason: tag.latestReason,
         highestStableVersion: tag.highestStableVersion,
-        remoteHasNewerStable: tag.remoteHasNewerStable
+        remoteHasNewerStable: tag.remoteHasNewerStable,
+        remoteQueryOk: tag.remoteQueryOk,
+        remoteQueryError: tag.remoteQueryError,
+        publishAttempts: 0
       };
 
       if (options.dryRun) {
@@ -597,6 +672,7 @@ function main() {
       const result = {
         ...baseResult,
         status: publishResult.status,
+        publishAttempts: publishResult.attempts,
         error: publishResult.status === 'failed' ? publishResult.output : ''
       };
       results.push(result);
@@ -607,6 +683,9 @@ function main() {
     const summary = {
       registryUrl: options.registryUrl,
       latestPolicy: options.latestPolicy,
+      skipExisting: options.skipExisting,
+      failOnRemoteQueryError: options.failOnRemoteQueryError,
+      publishRetries: options.publishRetries,
       bundleDir,
       manifestFile,
       workDir,

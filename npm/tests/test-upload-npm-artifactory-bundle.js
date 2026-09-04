@@ -71,6 +71,10 @@ if (args[0] === 'view') {
     process.stdout.write(JSON.stringify(['1.0.0']));
     process.exit(0);
   }
+  if (name === 'query-fail-pkg') {
+    process.stderr.write('npm ERR! code E500\\n');
+    process.exit(1);
+  }
   process.stdout.write(JSON.stringify([]));
   process.exit(0);
 }
@@ -108,7 +112,8 @@ try {
     { name: 'ahead-pkg', version: '2.0.0' },
     { name: 'new-pkg', version: '1.0.0' },
     { name: 'new-pkg', version: '2.0.0-beta.1' },
-    { name: 'new-pkg', version: '2.0.0' }
+    { name: 'new-pkg', version: '2.0.0' },
+    { name: 'query-fail-pkg', version: '1.0.0' }
   ]);
 
   const dryRun = run(process.execPath, [
@@ -130,7 +135,10 @@ try {
   assert.strictEqual(tagFor('new-pkg', '1.0.0'), 'airgap-1.0.0');
   assert.strictEqual(tagFor('new-pkg', '2.0.0-beta.1'), 'airgap-2.0.0-beta.1');
   assert.strictEqual(tagFor('new-pkg', '2.0.0'), 'latest');
+  assert.strictEqual(tagFor('query-fail-pkg', '1.0.0'), 'airgap-1.0.0');
   assert.strictEqual(drySummary.results.find((item) => item.package === 'ahead-pkg' && item.version === '2.0.0').remoteHasNewerStable, true);
+  assert.strictEqual(drySummary.results.find((item) => item.package === 'query-fail-pkg').remoteQueryOk, false);
+  assert.strictEqual(drySummary.remoteByPackage['query-fail-pkg'].latestProtected, true);
 
   const sameBundle = makeBundle('bundle-same', [
     { name: 'same-pkg', version: '1.0.0' }
