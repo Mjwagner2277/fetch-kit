@@ -4,8 +4,9 @@
 internet-connected machine to resolve, pack, and stage npm packages for an
 airgapped Artifactory upload process.
 
-The script produces one transfer tar per run. The Artifactory uploader is not
-maintained here; it can consume the manifests inside the tar.
+The downloader produces one transfer tar per run. The Artifactory uploader is a
+separate Node script that can be maintained in the airgapped environment and
+consume either the transfer tar or an extracted bundle directory.
 
 ## Quick Start
 
@@ -35,6 +36,16 @@ node npm/download-npm-artifactory-bundle.js \
   --registry "https://registry.example.com/" \
   --token "$NPM_TOKEN" \
   @company/app
+```
+
+Upload the transfer tar from the airgapped environment:
+
+```bash
+node upload-npm-artifactory-bundle.js \
+  --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --token "$ARTIFACTORY_TOKEN" \
+  --skip-existing
 ```
 
 ## Output
@@ -81,6 +92,50 @@ engine metadata, and whether it was a root request.
 
 ```text
 name    version    tarball
+```
+
+## Artifactory Upload
+
+`upload-npm-artifactory-bundle.js` is intentionally separate from the transfer
+tar. Copy and maintain that script in the airgapped environment, then point it
+at each transfer tar.
+
+Required upload inputs:
+
+- `--bundle-tar`: transfer tar from the download machine.
+- `--registry-url`: Artifactory npm registry URL, normally
+  `https://host/artifactory/api/npm/<repo>/`.
+- authentication via `--token`, `--username`/`--password`, or `--userconfig`.
+
+The uploader always passes an explicit npm dist-tag. It does not rely on
+`npm publish` defaults.
+
+Default `latest` handling uses `--latest-policy computed`:
+
+1. Read incoming versions from the bundle.
+2. Query Artifactory with `npm view <package> versions --json`.
+3. Compute the highest stable version across Artifactory and the incoming
+   bundle.
+4. Publish an incoming stable version with `latest` only if it is that highest
+   stable version.
+5. Publish older versions and prerelease versions with `airgap-<version>`.
+
+That means if Artifactory already has `some-lib@3.0.0`, and the transfer tar
+contains `some-lib@2.0.0`, the uploader publishes `2.0.0` with
+`airgap-2.0.0`, not `latest`.
+
+If Artifactory version lookup fails, the default policy fails the run so it
+does not accidentally move `latest` backwards. Use `--latest-policy never` when
+you want to avoid `latest` tags entirely.
+
+Dry-run example:
+
+```bash
+node upload-npm-artifactory-bundle.js \
+  --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
+  --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
+  --token "$ARTIFACTORY_TOKEN" \
+  --dry-run
 ```
 
 ## State Behavior
