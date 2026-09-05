@@ -247,10 +247,10 @@ range, not necessarily that an application calls vulnerable code.
 
 The CSV includes every downloaded package/module version, its `go` directive,
 the number of matching advisories, the highest-ranked CVE/advisory, fixed
-version, and the fixed version's `go` directive. The fixed Go directive comes
-from the local proxy cache when present; when the helper is given `--proxy`, it
-can also look up the fixed version's `.mod` file from that proxy during the
-connected-side run.
+version, CVE score, and the fixed version's `go` directive. The fixed Go
+directive comes from the local proxy cache when present; when the helper is
+given `--proxy`, it can also look up the fixed version's `.mod` file from that
+proxy during the connected-side run.
 
 Run the whole connected-side workflow with one helper:
 

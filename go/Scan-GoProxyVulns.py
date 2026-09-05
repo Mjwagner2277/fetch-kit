@@ -81,6 +81,12 @@ def semver_sort_key(version: str) -> tuple[int, int, int, int, str]:
     return (major, minor, patch, stable, prerelease)
 
 
+def normalize_go_module_version(version: str) -> str:
+    if re.match(r"^\d+\.\d+\.\d+", version):
+        return "v" + version
+    return version
+
+
 def compare_versions(left: str, right: str) -> int:
     left_key = semver_sort_key(left)
     right_key = semver_sort_key(right)
@@ -229,7 +235,7 @@ def fixed_versions_for_module(affected: dict[str, Any]) -> list[str]:
         for event in version_range.get("events", []) or []:
             fixed = event.get("fixed")
             if fixed:
-                versions.append(fixed)
+                versions.append(normalize_go_module_version(fixed))
     return sorted(set(versions), key=semver_sort_key)
 
 
@@ -365,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
                 "HighestCVE": highest.cve if highest else "",
                 "HighestVulnerabilityID": highest.vuln_id if highest else "",
                 "Severity": highest.severity if highest else "",
+                "CVEScore": f"{highest.severity_score:g}" if highest and highest.severity_score else "",
                 "FixedVersion": highest.fixed_version if highest else "",
                 "FixedGoVersion": highest.fixed_go_version if highest else "",
                 "Aliases": csv_join(highest.aliases) if highest else "",
@@ -384,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
         "HighestCVE",
         "HighestVulnerabilityID",
         "Severity",
+        "CVEScore",
         "FixedVersion",
         "FixedGoVersion",
         "Aliases",

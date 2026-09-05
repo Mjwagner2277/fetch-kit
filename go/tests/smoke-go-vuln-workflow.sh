@@ -55,6 +55,7 @@ record = {
     "id": "GO-2026-0001",
     "summary": "Synthetic vulnerability",
     "aliases": ["CVE-2026-9999", "GHSA-test"],
+    "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H 9.8"}],
     "affected": [
         {
             "package": {"ecosystem": "Go", "name": "example.com/vulnerable"},
@@ -139,6 +140,7 @@ checks = {
     "VulnerabilityCount": "1",
     "HighestCVE": "CVE-2026-9999",
     "HighestVulnerabilityID": "GO-2026-0001",
+    "CVEScore": "9.8",
     "FixedVersion": "v1.0.1",
     "FixedGoVersion": "1.27",
 }
