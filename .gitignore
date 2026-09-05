@@ -19,3 +19,9 @@ npm-artifactory-cache/
 npm-state/
 npm/**/sample-results/
 npm/**/artifactory-upload/
+oci-image-bundle/
+oci-image-bundle*.tar
+oci-image-bundle*.tar.gz
+oci-image-bundle*.tgz
+oci-upload-summary.json
+podman/registry-credentials.json

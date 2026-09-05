@@ -1,0 +1,40 @@
+# Starter OCI mirror set for a Linux AMD64 RHEL 9-oriented CI environment.
+# Review licenses, image trust, supported architectures, and approved versions.
+# Replace moving tags with approved sha256 digests for a production baseline.
+
+# Red Hat UBI 9 base images. UBI minimal/micro are the slim variants.
+registry.access.redhat.com/ubi9/ubi:9.7
+registry.access.redhat.com/ubi9/ubi-init:9.7
+registry.access.redhat.com/ubi9/ubi-minimal:9.7
+registry.access.redhat.com/ubi9/ubi-micro:9.7
+
+# Iron Bank hardened UBI 9 images. Registry1 authentication is required.
+registry1.dso.mil/ironbank/redhat/ubi/ubi9:9.7
+registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:9.7
+registry1.dso.mil/ironbank/redhat/ubi/ubi9-micro:9.7
+
+# RHEL 9-based language build/runtime images.
+registry.access.redhat.com/ubi9/python-312:latest
+registry.access.redhat.com/ubi9/nodejs-22-minimal:latest
+registry.access.redhat.com/ubi9/go-toolset:latest
+registry.access.redhat.com/ubi9/openjdk-21-runtime:latest
+
+# General CI shells and language toolchains.
+docker.io/library/alpine:3.22
+docker.io/library/busybox:1.37
+docker.io/library/python:3.13-slim-bookworm
+docker.io/library/node:22-bookworm-slim
+docker.io/library/golang:1.26-bookworm
+docker.io/library/eclipse-temurin:21-jdk-ubi9-minimal
+
+# Container build, inspection, and vulnerability tooling.
+docker.io/library/docker:cli
+quay.io/containers/podman:latest
+quay.io/buildah/stable:latest
+quay.io/skopeo/stable:latest
+ghcr.io/aquasecurity/trivy:latest
+
+# CI runners and common disposable test services.
+registry.gitlab.com/gitlab-org/gitlab-runner:alpine
+docker.io/library/postgres:17-alpine
+docker.io/library/redis:8-alpine

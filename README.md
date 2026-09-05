@@ -15,7 +15,9 @@ container CLIs.
   without mounting the ISO.
 - `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
 - `grype/` - Grype vulnerability database retrieval without invoking Grype.
-- `podman/` - OCI image retrieval without invoking Podman, Docker, Skopeo, or ORAS.
+- `podman/` - Python OCI image list retrieval, air-gap transfer bundles, and a
+  Bash Artifactory Docker repository uploader without invoking Podman, Docker,
+  Skopeo, ORAS, or the JFrog CLI.
 - `rpm/` - RHEL-compatible EL9 RPM dependency retrieval without invoking DNF,
   RPM, or Red Hat subscription workflows.
 - `rust/` - Cargo crate and dependency retrieval without invoking Cargo.
@@ -85,6 +87,7 @@ CSV exports are optional for spreadsheet or diff workflows:
   -CsvOutput .\rhel-family-iso-review.csv
 ```
 
-## Podman Pull Replacement
+## OCI Image Transfer
 
-See [podman/README.md](podman/README.md) for examples and limitations.
+See [podman/README.md](podman/README.md) for the Python download, transfer, and
+Artifactory upload workflow.
