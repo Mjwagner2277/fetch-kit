@@ -119,6 +119,12 @@ selected platform, resolved manifest digest, config and layers, and optional
 destination overrides. Shared blobs are stored once. Cached blobs are reused
 only after their content digest is verified.
 
+At the start of every run, the downloader removes the prior `SHA256SUMS` from
+the selected output directory. It writes the replacement atomically only after
+all requested manifest, config, and layer blobs have been downloaded, pruned,
+and verified. This prevents an interrupted rerun from leaving old checksum
+metadata beside a partially updated blob directory.
+
 The transfer archive contains the whole directory under one top-level folder.
 The Bash uploader reads the canonical `bundle-manifest.json` with `jq`, so there
 is no duplicate upload manifest to keep synchronized. Move the archive and this
@@ -190,6 +196,28 @@ Use `--skip-existing` when an existing destination tag must never be replaced.
 By default, missing blobs are reused and the tag is published or updated. A
 digest-only source is assigned a tag such as `sha256-<full digest>` unless a
 JSON list supplies `targetTag`.
+
+### Missing blob troubleshooting
+
+If the uploader reports that a file listed in `SHA256SUMS` is missing, do not
+upload that bundle. It is incomplete. With the current downloader, this should
+only occur if an older bundle was created before the checksum-safety change or
+if files were removed after the download completed.
+
+Regenerate into a new directory and transfer the completed archive rather than
+copying the live output directory while it is being populated:
+
+```bash
+python3 Get-ContainerImage.py \
+  --images-file recommended-rhel9-ci-images.txt \
+  --output-directory oci-image-bundle-clean \
+  --archive-output oci-image-bundle-clean.tar.gz
+```
+
+The downloader verifies every descriptor referenced by `bundle-manifest.json`,
+then verifies every newly written `SHA256SUMS` entry before creating the
+archive. A failed or interrupted rerun leaves no `SHA256SUMS`, so the uploader
+rejects it immediately instead of using stale metadata.
 
 ## Choosing and Pinning Images
 

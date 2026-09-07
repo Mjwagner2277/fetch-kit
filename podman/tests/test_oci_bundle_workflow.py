@@ -185,6 +185,13 @@ def run(command: list[str], cwd: Path) -> dict[str, object]:
     return json.loads(completed.stdout)
 
 
+def run_failure(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    if completed.returncode == 0:
+        raise AssertionError(f"Command unexpectedly succeeded: {' '.join(command)}")
+    return completed
+
+
 def main() -> int:
     shorthand = parse_image_reference("alpine:3.22")
     assert shorthand.registry == "registry-1.docker.io"
@@ -212,6 +219,28 @@ def main() -> int:
             )
             bundle = root / "bundle"
             archive = root / "bundle.tar.gz"
+
+            stale_bundle = root / "stale-bundle"
+            stale_bundle.mkdir()
+            stale_checksum = stale_bundle / "SHA256SUMS"
+            stale_checksum.write_text(
+                f"{'0' * 64}  blobs/sha256/{'0' * 64}\n",
+                encoding="utf-8",
+            )
+            run_failure(
+                [
+                    sys.executable,
+                    "-B",
+                    str(podman_dir / "Get-ContainerImage.py"),
+                    f"{host}/acme/widget:missing",
+                    "--output-directory",
+                    str(stale_bundle),
+                    "--insecure",
+                ],
+                podman_dir,
+            )
+            assert not stale_checksum.exists()
+
             download = run(
                 [
                     sys.executable,
@@ -234,6 +263,9 @@ def main() -> int:
             assert (bundle / "bundle-manifest.json").is_file()
             assert not (bundle / "artifactory-upload-manifest.tsv").exists()
             assert (bundle / "blobs" / "sha256" / state.layer_digest.split(":", 1)[1]).read_bytes() == state.layer
+            for checksum_line in (bundle / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+                _, relative = checksum_line.split("  ", 1)
+                assert (bundle / relative).is_file(), relative
 
             upload = run(
                 [

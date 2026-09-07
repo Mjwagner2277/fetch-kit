@@ -284,7 +284,8 @@ verify_bundle_checksums() {
     expected="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
     relative="${BASH_REMATCH[2]}"
     validate_relative_path "$relative"
-    [[ -f "$bundle_dir/$relative" ]] || die "Bundle file listed in SHA256SUMS is missing: $relative"
+    [[ -f "$bundle_dir/$relative" ]] || \
+      die "Bundle file listed in SHA256SUMS is missing: $relative; regenerate the bundle in a fresh output directory"
     actual="$(sha256_file "$bundle_dir/$relative")"
     [[ "$actual" == "$expected" ]] || die "Bundle checksum mismatch: $relative"
     ((count += 1))

@@ -319,12 +319,62 @@ def credential_map(args: argparse.Namespace, requests: list[ImageRequest]) -> di
 
 def write_checksums(bundle: Path) -> Path:
     checksum_file = bundle / "SHA256SUMS"
+    temporary = bundle / "SHA256SUMS.partial"
+    temporary.unlink(missing_ok=True)
     lines = []
-    for path in sorted(item for item in bundle.rglob("*") if item.is_file() and item != checksum_file):
+    excluded = {checksum_file, temporary}
+    for path in sorted(item for item in bundle.rglob("*") if item.is_file() and item not in excluded):
         relative = path.relative_to(bundle).as_posix()
         lines.append(f"{digest_file(path).split(':', 1)[1]}  {relative}")
-    checksum_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    temporary.replace(checksum_file)
     return checksum_file
+
+
+def validate_bundle_content(layout: Path, records: list[dict[str, Any]], skip_layers: bool) -> None:
+    """Verify that every descriptor promised by the bundle is present and intact."""
+    expected: set[str] = set()
+    for record in records:
+        source_index_digest = str(record.get("sourceIndexDigest", ""))
+        if source_index_digest:
+            expected.add(source_index_digest)
+        for name in ("manifest", "config"):
+            descriptor = record.get(name)
+            if not isinstance(descriptor, dict) or not descriptor.get("digest"):
+                raise RegistryError(f"Bundle record for {record.get('source', 'image')} has no {name} digest")
+            expected.add(str(descriptor["digest"]))
+        if not skip_layers:
+            for descriptor in record.get("layers", []):
+                if not isinstance(descriptor, dict) or not descriptor.get("digest"):
+                    raise RegistryError(
+                        f"Bundle record for {record.get('source', 'image')} contains a layer without a digest"
+                    )
+                expected.add(str(descriptor["digest"]))
+
+    for digest in sorted(expected):
+        path = blob_path(layout, digest)
+        if not path.is_file():
+            raise RegistryError(f"Bundle is missing downloaded blob {digest}: {path}")
+        validate_file_digest(path, digest)
+
+
+def verify_checksums(bundle: Path) -> None:
+    checksum_file = bundle / "SHA256SUMS"
+    if not checksum_file.is_file():
+        raise RegistryError("Bundle checksum manifest was not created")
+    for number, line in enumerate(checksum_file.read_text(encoding="utf-8").splitlines(), 1):
+        if not line:
+            continue
+        try:
+            expected, relative = line.split("  ", 1)
+        except ValueError as exc:
+            raise RegistryError(f"Invalid SHA256SUMS entry on line {number}") from exc
+        path = bundle / relative
+        if not path.is_file():
+            raise RegistryError(f"SHA256SUMS references a missing bundle file: {relative}")
+        actual = digest_file(path).split(":", 1)[1]
+        if actual != expected.lower():
+            raise RegistryError(f"SHA256SUMS verification failed for {relative}")
 
 
 def prune_unreferenced_blobs(layout: Path, records: list[dict[str, Any]], skip_layers: bool) -> int:
@@ -425,6 +475,10 @@ def main(argv: list[str] | None = None) -> int:
 
     layout = Path(args.output_directory).resolve()
     layout.mkdir(parents=True, exist_ok=True)
+    # An interrupted rerun must not leave an old checksum manifest that makes a
+    # partially updated directory look like a completed bundle.
+    (layout / "SHA256SUMS").unlink(missing_ok=True)
+    (layout / "SHA256SUMS.partial").unlink(missing_ok=True)
     (layout / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
     credentials = credential_map(args, requests)
     clients: dict[str, RegistryClient] = {}
@@ -453,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
     removed_blobs = prune_unreferenced_blobs(layout, records, args.skip_layers)
     if removed_blobs:
         status(f"pruned {removed_blobs} unreferenced cached blob(s)")
+    validate_bundle_content(layout, records, args.skip_layers)
 
     write_json(layout / "oci-layout", {"imageLayoutVersion": "1.0.0"})
     write_json(layout / "index.json", {"schemaVersion": 2, "manifests": index_descriptors})
@@ -469,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     (layout / "artifactory-upload-manifest.tsv").unlink(missing_ok=True)
     (layout / "README.txt").write_text(bundle_readme(args.platform), encoding="utf-8")
     write_checksums(layout)
+    verify_checksums(layout)
 
     archive_path = Path(args.archive_output).resolve() if args.archive_output else None
     if archive_path:
