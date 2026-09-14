@@ -197,6 +197,11 @@ The uploader always passes an explicit npm dist-tag. It does not rely on
 default so reruns of large bundles can continue making progress. Use
 `--no-skip-existing` for strict conflict handling.
 
+Before publishing, the uploader validates every manifest tarball path and
+confirms each tarball contains `package/package.json` with the expected package
+name and version. If that check fails, the manifest is pointing at the wrong
+file or the tarball is not an npm package produced by `npm pack`.
+
 Default `latest` handling uses `--latest-policy computed`:
 
 1. Read incoming versions from the bundle.

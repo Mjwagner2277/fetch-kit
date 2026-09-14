@@ -332,6 +332,37 @@ RESULTS_JSON="${WORK_DIR}/upload-results.json"
 SUMMARY_JSON="${WORK_DIR}/upload-summary.json"
 PUBLISH_LOG="${WORK_DIR}/npm-publish.log"
 
+extract_tarball_package_json() {
+  local tarball_path="$1"
+  tar -xOzf "$tarball_path" package/package.json 2>/dev/null && return 0
+  tar -xOzf "$tarball_path" ./package/package.json 2>/dev/null && return 0
+  return 1
+}
+
+validate_package_tarball() {
+  local name="$1"
+  local version="$2"
+  local tarball_path="$3"
+  local package_ref="$4"
+  local package_json
+  local actual
+  local actual_name
+  local actual_version
+
+  if ! package_json="$(extract_tarball_package_json "$tarball_path")"; then
+    fail "Package tarball for ${package_ref} does not contain package/package.json: ${tarball_path}. Use the downloader transfer tar or a manifest that points at npm package .tgz files."
+  fi
+
+  if ! actual="$(printf '%s\n' "$package_json" | jq -r '[.name // "", ((.version // "") | tostring)] | @tsv')"; then
+    fail "Package tarball for ${package_ref} contains package/package.json that is not valid JSON: ${tarball_path}"
+  fi
+
+  IFS=$'\t' read -r actual_name actual_version <<< "$actual"
+  if [[ "$actual_name" != "$name" || "$actual_version" != "$version" ]]; then
+    fail "Package tarball mismatch for ${package_ref}: manifest points to ${tarball_path}, but package/package.json contains ${actual_name}@${actual_version}"
+  fi
+}
+
 read_manifest() {
   local jsonl="${BUNDLE_DIR_RESOLVED}/packages.jsonl"
   local json="${BUNDLE_DIR_RESOLVED}/packages.json"
@@ -376,6 +407,7 @@ read_manifest() {
       || fail "Manifest entry is missing name, version, or tarball in $MANIFEST_FILE"
     [[ -f "${BUNDLE_DIR_RESOLVED}/${tarball}" ]] \
       || fail "Tarball not found for ${package_ref}: ${BUNDLE_DIR_RESOLVED}/${tarball}"
+    validate_package_tarball "$name" "$version" "${BUNDLE_DIR_RESOLVED}/${tarball}" "$package_ref"
   done < "$PACKAGES_TSV"
 }
 
