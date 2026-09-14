@@ -4,8 +4,8 @@
 internet-connected machine to resolve, pack, and stage npm packages for an
 airgapped Artifactory upload process.
 
-The downloader produces one transfer tar per run. The Artifactory uploader is a
-separate Node script that can be maintained in the airgapped environment and
+The downloader produces one transfer tar per run. The registry uploader is a
+separate Bash script that can be maintained in the airgapped environment and
 consume either the transfer tar or an extracted bundle directory.
 
 ## Quick Start
@@ -110,7 +110,7 @@ Versioned entries stay pinned or ranged exactly as requested.
 Upload the transfer tar from the airgapped environment:
 
 ```bash
-node upload-npm-artifactory-bundle.js \
+bash upload-npm-artifactory-bundle.sh \
   --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
   --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
   --token "$ARTIFACTORY_TOKEN"
@@ -162,20 +162,35 @@ engine metadata, and whether it was a root request.
 name    version    tarball
 ```
 
-## Artifactory Upload
+## npm Registry Upload
 
-`upload-npm-artifactory-bundle.js` is intentionally separate from the transfer
-tar. Copy and maintain that script in the airgapped environment, then point it
-at each transfer tar.
+`upload-npm-artifactory-bundle.sh` is intentionally separate from the transfer
+tar. Copy and maintain that Bash script in the airgapped environment, then
+point it at each transfer tar.
+
+The uploader is registry-generic despite the file name. It only uses npm CLI
+operations: `npm view <package> versions --json` to inspect the target registry
+and `npm publish <tarball> --tag <tag>` to upload. That means the latest-tag
+logic applies to Artifactory and to other npm-compatible registries that support
+those standard npm operations. If the target registry cannot answer the version
+query for a package, the default behavior is to avoid `latest` for that package.
 
 Required upload inputs:
 
 - `--bundle-tar`: transfer tar from the download machine.
-- `--registry-url`: Artifactory npm registry URL, normally
+- `--registry-url`: target npm registry URL, for Artifactory normally
   `https://host/artifactory/api/npm/<repo>/`.
 - authentication via `--token`, `--username`/`--password`, or `--userconfig`.
 - use `--no-ssl` when npm must talk to an HTTPS registry with certificate
   validation disabled.
+
+Required upload tools on the airgapped machine:
+
+- `bash`
+- `npm`
+- `jq`
+- `tar`
+- GNU-compatible `sort -V`
 
 The uploader always passes an explicit npm dist-tag. It does not rely on
 `npm publish` defaults. It also treats already-published versions as success by
@@ -185,18 +200,18 @@ default so reruns of large bundles can continue making progress. Use
 Default `latest` handling uses `--latest-policy computed`:
 
 1. Read incoming versions from the bundle.
-2. Query Artifactory with `npm view <package> versions --json`.
-3. Compute the highest stable version across Artifactory and the incoming
+2. Query the target registry with `npm view <package> versions --json`.
+3. Compute the highest stable version across the target registry and the incoming
    bundle.
 4. Publish an incoming stable version with `latest` only if it is that highest
    stable version.
 5. Publish older versions and prerelease versions with `airgap-<version>`.
 
-That means if Artifactory already has `some-lib@3.0.0`, and the transfer tar
+That means if the target registry already has `some-lib@3.0.0`, and the transfer tar
 contains `some-lib@2.0.0`, the uploader publishes `2.0.0` with
 `airgap-2.0.0`, not `latest`.
 
-If Artifactory version lookup fails for one package, the default policy avoids
+If target registry version lookup fails for one package, the default policy avoids
 `latest` for that package and continues with the rest of the bundle. That keeps
 the upload fail-closed for tag safety while maximizing progress on large sets.
 Use `--fail-on-remote-query-error` for strict lookup handling, or
@@ -205,7 +220,7 @@ Use `--fail-on-remote-query-error` for strict lookup handling, or
 Dry-run example:
 
 ```bash
-node upload-npm-artifactory-bundle.js \
+bash upload-npm-artifactory-bundle.sh \
   --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
   --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
   --token "$ARTIFACTORY_TOKEN" \
@@ -217,7 +232,7 @@ For large uploads, provide a durable work directory so `upload-results.json`,
 `upload-results.jsonl`, and `npm-publish.log` remain available:
 
 ```bash
-node upload-npm-artifactory-bundle.js \
+bash upload-npm-artifactory-bundle.sh \
   --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
   --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
   --token "$ARTIFACTORY_TOKEN" \
