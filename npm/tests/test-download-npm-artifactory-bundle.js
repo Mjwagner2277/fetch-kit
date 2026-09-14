@@ -28,6 +28,7 @@ function run(command, args, options = {}) {
 
 try {
   const fakeNpm = path.join(tmp, 'fake-npm.js');
+  const fakeNpmLog = path.join(tmp, 'fake-npm.log');
   fs.writeFileSync(fakeNpm, `#!/usr/bin/env node
 'use strict';
 const fs = require('fs');
@@ -35,6 +36,14 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const args = process.argv.slice(2);
+const logFile = ${JSON.stringify(fakeNpmLog)};
+fs.appendFileSync(logFile, JSON.stringify({
+  args,
+  strictSsl: process.env.npm_config_strict_ssl || '',
+  cpu: process.env.npm_config_cpu || '',
+  os: process.env.npm_config_os || '',
+  libc: process.env.npm_config_libc || ''
+}) + '\\n');
 function argValue(prefix) {
   const value = args.find((arg) => arg.startsWith(prefix));
   return value ? value.slice(prefix.length) : '';
@@ -143,6 +152,10 @@ process.exit(1);
   const stdout = run(process.execPath, [
     downloader,
     '--node-version', '20.11.1',
+    '--no-ssl',
+    '--target-os', 'linux',
+    '--target-arch', 'arm64',
+    '--target-libc', 'musl',
     '--npm-bin', fakeNpm,
     '--output-dir', outputDir,
     '--state-dir', stateDir,
@@ -151,9 +164,24 @@ process.exit(1);
   const summary = JSON.parse(stdout);
 
   assert.strictEqual(summary.nodeVersion, '20.11.1');
+  assert.strictEqual(summary.strictSsl, false);
+  assert.deepStrictEqual(summary.targetPlatform, { arch: 'arm64', os: 'linux', libc: 'musl' });
   assert.strictEqual(summary.packageCount, 1);
   assert.ok(fs.existsSync(summary.transferTarFile));
   assert.ok(fs.existsSync(path.join(stateDir, 'node-v20.11.1.json')));
+  const npmLog = fs.readFileSync(fakeNpmLog, 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const installLog = npmLog.find((entry) => entry.args[0] === 'install');
+  assert.ok(installLog.args.includes('--strict-ssl=false'));
+  assert.ok(installLog.args.includes('--os=linux'));
+  assert.ok(installLog.args.includes('--cpu=arm64'));
+  assert.ok(installLog.args.includes('--libc=musl'));
+  assert.strictEqual(installLog.strictSsl, 'false');
+  assert.strictEqual(installLog.os, 'linux');
+  assert.strictEqual(installLog.cpu, 'arm64');
+  assert.strictEqual(installLog.libc, 'musl');
 
   const extractDir = path.join(tmp, 'extract');
   fs.mkdirSync(extractDir);

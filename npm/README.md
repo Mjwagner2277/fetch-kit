@@ -36,6 +36,17 @@ node npm/download-npm-artifactory-bundle.js \
   --packages-file packages-node-20.txt
 ```
 
+Download for a specific airgapped npm platform:
+
+```bash
+node npm/download-npm-artifactory-bundle.js \
+  --node-version 20.11.1 \
+  --target-os linux \
+  --target-arch x64 \
+  --target-libc glibc \
+  --packages-file packages-node-20.txt
+```
+
 Download everything already recorded for that same Node.js version:
 
 ```bash
@@ -51,6 +62,7 @@ node npm/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --registry "https://registry.example.com/" \
   --token "$NPM_TOKEN" \
+  --no-ssl \
   @company/app
 ```
 
@@ -162,6 +174,8 @@ Required upload inputs:
 - `--registry-url`: Artifactory npm registry URL, normally
   `https://host/artifactory/api/npm/<repo>/`.
 - authentication via `--token`, `--username`/`--password`, or `--userconfig`.
+- use `--no-ssl` when npm must talk to an HTTPS registry with certificate
+  validation disabled.
 
 The uploader always passes an explicit npm dist-tag. It does not rely on
 `npm publish` defaults. It also treats already-published versions as success by
@@ -195,6 +209,7 @@ node upload-npm-artifactory-bundle.js \
   --bundle-tar npm-artifactory-bundle-node-v20.11.1-20260904T201500Z.tar \
   --registry-url "https://art.example.com/artifactory/api/npm/npm-local/" \
   --token "$ARTIFACTORY_TOKEN" \
+  --no-ssl \
   --dry-run
 ```
 
@@ -241,6 +256,34 @@ Supported engine range forms include:
 If a transitive package has an incompatible `engines.node` range, the run fails
 by default. Use `--allow-engine-mismatches` to record those mismatches in the
 bundle manifests instead of failing.
+
+## Target Platform
+
+Use `--target-arch` when the airgapped runtime architecture differs from the
+download machine:
+
+```bash
+node npm/download-npm-artifactory-bundle.js \
+  --node-version 20.11.1 \
+  --target-arch arm64 \
+  @company/app
+```
+
+For Linux targets, prefer setting the full npm platform:
+
+```bash
+node npm/download-npm-artifactory-bundle.js \
+  --node-version 20.11.1 \
+  --target-os linux \
+  --target-arch arm64 \
+  --target-libc glibc \
+  @company/app
+```
+
+These flags map to npm's `cpu`, `os`, and `libc` config values. They affect
+dependency resolution for platform-specific native and optional packages.
+Every bundle records the requested target platform in `summary.json` and
+`README.txt`.
 
 ## Package Normalization
 

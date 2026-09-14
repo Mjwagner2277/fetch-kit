@@ -31,6 +31,10 @@ Options:
   --token TOKEN               Bearer token for the source registry.
   --username USER             Basic auth username for the source registry.
   --password PASSWORD         Basic auth password/API key for the source registry.
+  --no-ssl                    Disable npm SSL certificate validation.
+  --target-arch ARCH          Target CPU architecture for npm resolution, e.g. x64, arm64.
+  --target-os OS              Target OS for npm resolution, e.g. linux, win32, darwin.
+  --target-libc LIBC          Target libc for Linux npm resolution, e.g. glibc, musl.
   --output-dir DIR            Transfer tar output root. Defaults to ./npm-artifactory-cache.
   --tar-file FILE             Exact transfer tar path. Defaults under --output-dir.
   --state-dir DIR             State root. Defaults to ./npm-state.
@@ -73,6 +77,10 @@ function parseArgs(argv) {
     token: process.env.NPM_TOKEN || '',
     username: process.env.NPM_USERNAME || '',
     password: process.env.NPM_PASSWORD || '',
+    strictSsl: true,
+    targetArch: '',
+    targetOs: '',
+    targetLibc: '',
     outputDir: path.resolve(process.cwd(), 'npm-artifactory-cache'),
     tarFile: '',
     stateDir: path.resolve(process.cwd(), 'npm-state'),
@@ -130,6 +138,23 @@ function parseArgs(argv) {
       case '--password':
         options.password = next();
         break;
+      case '--no-ssl':
+      case '--no-strict-ssl':
+        options.strictSsl = false;
+        break;
+      case '--target-arch':
+      case '--target-architecture':
+      case '--cpu':
+        options.targetArch = next();
+        break;
+      case '--target-os':
+      case '--os':
+        options.targetOs = next();
+        break;
+      case '--target-libc':
+      case '--libc':
+        options.targetLibc = next();
+        break;
       case '--output-dir':
         options.outputDir = path.resolve(next());
         break;
@@ -179,6 +204,15 @@ function parseArgs(argv) {
   if (!Number.isInteger(options.maxVersionProbes) || options.maxVersionProbes < 1) {
     fail('--max-version-probes must be a positive integer');
   }
+  for (const [flag, value] of [
+    ['--target-arch', options.targetArch],
+    ['--target-os', options.targetOs],
+    ['--target-libc', options.targetLibc]
+  ]) {
+    if (value && /[\s=]/.test(value)) {
+      fail(`${flag} cannot contain whitespace or =`);
+    }
+  }
 
   return options;
 }
@@ -205,6 +239,22 @@ function nodeStateSlug(nodeVersion) {
 
 function timestampSlug(date = new Date()) {
   return date.toISOString().replace(/[-:]/g, '').replace(/\..+$/, 'Z');
+}
+
+function targetPlatformSummary(options) {
+  return {
+    arch: options.targetArch || '',
+    os: options.targetOs || '',
+    libc: options.targetLibc || ''
+  };
+}
+
+function formatTargetPlatform(options) {
+  const parts = [];
+  if (options.targetOs) parts.push(`os=${options.targetOs}`);
+  if (options.targetArch) parts.push(`arch=${options.targetArch}`);
+  if (options.targetLibc) parts.push(`libc=${options.targetLibc}`);
+  return parts.length > 0 ? parts.join(', ') : 'npm host defaults';
 }
 
 function splitPackageSpec(spec) {
@@ -358,6 +408,18 @@ function npmArgsWithConfig(options) {
   if (options.userconfig) {
     args.push(`--userconfig=${options.userconfig}`);
   }
+  if (!options.strictSsl) {
+    args.push('--strict-ssl=false');
+  }
+  if (options.targetArch) {
+    args.push(`--cpu=${options.targetArch}`);
+  }
+  if (options.targetOs) {
+    args.push(`--os=${options.targetOs}`);
+  }
+  if (options.targetLibc) {
+    args.push(`--libc=${options.targetLibc}`);
+  }
   return args;
 }
 
@@ -366,6 +428,18 @@ function npmEnv(options) {
     ...process.env,
     npm_config_engine_strict: 'false'
   };
+  if (!options.strictSsl) {
+    env.npm_config_strict_ssl = 'false';
+  }
+  if (options.targetArch) {
+    env.npm_config_cpu = options.targetArch;
+  }
+  if (options.targetOs) {
+    env.npm_config_os = options.targetOs;
+  }
+  if (options.targetLibc) {
+    env.npm_config_libc = options.targetLibc;
+  }
   if (options.cacheDir) {
     env.npm_config_cache = options.cacheDir;
   }
@@ -414,6 +488,9 @@ function writeGeneratedNpmrc(options, dir) {
   const fragment = `//${registry.replace(/^https?:\/\//, '')}`;
   const npmrc = path.join(dir, 'source-registry.npmrc');
   const lines = [`registry=${registry}`, `${fragment}:always-auth=true`];
+  if (!options.strictSsl) {
+    lines.push('strict-ssl=false');
+  }
   if (options.token) {
     lines.push(`${fragment}:_authToken=${options.token}`);
   } else {
@@ -919,6 +996,7 @@ function writeBundleReadme(bundleDir, options) {
     'npm Artifactory transfer bundle',
     '',
     `Target Node.js version: ${options.nodeVersion}`,
+    `Target npm platform: ${formatTargetPlatform(options)}`,
     '',
     'This directory is intended to be transported as the single .tar file created by the downloader.',
     '',
@@ -1134,6 +1212,8 @@ function main() {
       at: now,
       nodeVersion: options.nodeVersion,
       registry: options.registry || 'npm-config-default',
+      strictSsl: options.strictSsl,
+      targetPlatform: targetPlatformSummary(options),
       transferTarFile,
       bundleName,
       rootPackages,
@@ -1161,6 +1241,8 @@ function main() {
     const summary = {
       nodeVersion: options.nodeVersion,
       registry: options.registry || 'npm-config-default',
+      strictSsl: options.strictSsl,
+      targetPlatform: targetPlatformSummary(options),
       transferTarFile,
       bundleName,
       stateFile,

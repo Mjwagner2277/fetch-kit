@@ -121,6 +121,7 @@ try {
     '--bundle-tar', mainBundle.tarFile,
     '--registry-url', 'https://art.example.com/artifactory/api/npm/npm-local/',
     '--token', 'test-token',
+    '--no-ssl',
     '--npm-bin', fakeNpm,
     '--work-dir', path.join(tmp, 'work-dry-run'),
     '--dry-run'
@@ -136,10 +137,13 @@ try {
   assert.strictEqual(tagFor('new-pkg', '2.0.0-beta.1'), 'airgap-2.0.0-beta.1');
   assert.strictEqual(tagFor('new-pkg', '2.0.0'), 'latest');
   assert.strictEqual(tagFor('query-fail-pkg', '1.0.0'), 'airgap-1.0.0');
+  assert.strictEqual(drySummary.strictSsl, false);
   assert.strictEqual(drySummary.results.find((item) => item.package === 'ahead-pkg' && item.version === '2.0.0').remoteHasNewerStable, true);
   assert.strictEqual(drySummary.results.find((item) => item.package === 'query-fail-pkg').remoteQueryOk, false);
   assert.strictEqual(drySummary.remoteByPackage['query-fail-pkg'].latestProtected, true);
+  assert.ok(readLog(logFile).some((args) => args[0] === 'view' && args.includes('--strict-ssl=false')));
 
+  fs.writeFileSync(logFile, '');
   const sameBundle = makeBundle('bundle-same', [
     { name: 'same-pkg', version: '1.0.0' }
   ]);
@@ -148,14 +152,17 @@ try {
     '--bundle-tar', sameBundle.tarFile,
     '--registry-url', 'https://art.example.com/artifactory/api/npm/npm-local/',
     '--token', 'test-token',
+    '--no-ssl',
     '--npm-bin', fakeNpm,
     '--work-dir', path.join(tmp, 'work-publish'),
     '--skip-existing'
   ]);
   const publishSummary = JSON.parse(publish.stdout);
+  assert.strictEqual(publishSummary.strictSsl, false);
   assert.strictEqual(publishSummary.skippedExisting, 1);
   assert.strictEqual(publishSummary.results[0].status, 'skipped-existing');
   assert.strictEqual(publishSummary.results[0].distTag, 'latest');
+  assert.ok(readLog(logFile).some((args) => args[0] === 'publish' && args.includes('--strict-ssl=false')));
 
   fs.writeFileSync(logFile, '');
   const never = run(process.execPath, [

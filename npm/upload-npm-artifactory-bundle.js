@@ -20,6 +20,7 @@ Options:
   --token TOKEN              Artifactory token. Defaults to ARTIFACTORY_TOKEN.
   --username USER            Artifactory username. Defaults to ARTIFACTORY_USERNAME.
   --password PASSWORD        Artifactory password/API key. Defaults to ARTIFACTORY_PASSWORD.
+  --no-ssl                   Disable npm SSL certificate validation.
   --work-dir DIR             Working directory for extraction, npmrc, logs, and summaries.
   --keep-work-dir            Keep a temporary work directory after completion.
   --skip-existing            Treat already-published versions as success. Default.
@@ -65,6 +66,7 @@ function parseArgs(argv) {
     token: process.env.ARTIFACTORY_TOKEN || '',
     username: process.env.ARTIFACTORY_USERNAME || '',
     password: process.env.ARTIFACTORY_PASSWORD || '',
+    strictSsl: true,
     workDir: '',
     keepWorkDir: false,
     skipExisting: true,
@@ -113,6 +115,10 @@ function parseArgs(argv) {
         break;
       case '--password':
         options.password = next();
+        break;
+      case '--no-ssl':
+      case '--no-strict-ssl':
+        options.strictSsl = false;
         break;
       case '--work-dir':
         options.workDir = path.resolve(next());
@@ -293,6 +299,9 @@ function writeGeneratedNpmrc(options, workDir) {
     `registry=${registry}`,
     `${fragment}:always-auth=true`
   ];
+  if (!options.strictSsl) {
+    lines.push('strict-ssl=false');
+  }
 
   if (options.token) {
     lines.push(`${fragment}:_authToken=${options.token}`);
@@ -307,10 +316,14 @@ function writeGeneratedNpmrc(options, workDir) {
 }
 
 function npmConfigArgs(options) {
-  return [
+  const args = [
     `--registry=${options.registryUrl}`,
     `--userconfig=${options.userconfig}`
   ];
+  if (!options.strictSsl) {
+    args.push('--strict-ssl=false');
+  }
+  return args;
 }
 
 function splitNpmFlags(flags) {
@@ -682,6 +695,7 @@ function main() {
     writeJson(resultsJson, results);
     const summary = {
       registryUrl: options.registryUrl,
+      strictSsl: options.strictSsl,
       latestPolicy: options.latestPolicy,
       skipExisting: options.skipExisting,
       failOnRemoteQueryError: options.failOnRemoteQueryError,
