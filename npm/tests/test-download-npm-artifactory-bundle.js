@@ -74,8 +74,9 @@ function writePackageTar(dest, name, version) {
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-npm-pack-'));
   const packageDir = path.join(work, 'package');
   fs.mkdirSync(packageDir, { recursive: true });
+  const packageJsonName = name === 'mismatch-lib' ? 'other-lib' : name;
   fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({
-    name,
+    name: packageJsonName,
     version,
     main: 'index.js',
     types: 'index.d.ts',
@@ -194,6 +195,7 @@ process.exit(1);
   const packages = JSON.parse(fs.readFileSync(path.join(bundleDir, 'packages.json'), 'utf8'));
   assert.strictEqual(packages[0].package, 'fake-lib@2.0.0');
   assert.strictEqual(packages[0].normalized, true);
+  assert.strictEqual(packages[0].packageJsonValidated, true);
 
   const packageExtractDir = path.join(tmp, 'package-extract');
   fs.mkdirSync(packageExtractDir);
@@ -261,6 +263,21 @@ process.exit(1);
   assert.strictEqual(jsonRoots.get('json-latest').resolvedVersion, '2.0.0');
   assert.strictEqual(jsonRoots.get('json-pinned').requested, '1.0.0');
   assert.strictEqual(jsonRoots.get('cli-pinned').requested, '1.0.0');
+
+  const mismatch = spawnSync(process.execPath, [
+    downloader,
+    '--node-version', '20.11.1',
+    '--npm-bin', fakeNpm,
+    '--output-dir', path.join(tmp, 'out-mismatch'),
+    '--state-dir', path.join(tmp, 'state-mismatch'),
+    'mismatch-lib@1.0.0'
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024 * 10
+  });
+  assert.notStrictEqual(mismatch.status, 0);
+  assert.match(`${mismatch.stdout}\n${mismatch.stderr}`, /Packed tarball mismatch for mismatch-lib@1\.0\.0/);
 
   console.log('download npm artifactory bundle: ok');
 } finally {

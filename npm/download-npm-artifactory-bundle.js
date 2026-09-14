@@ -955,6 +955,23 @@ function normalizeTarball(sourceTarball, outputTarball, options, workRoot) {
   run('tar', ['-czf', outputTarball, '-C', extractDir, 'package']);
 }
 
+function validatePackageTarball(pkg, tarball, workRoot) {
+  const extractDir = fs.mkdtempSync(path.join(workRoot, 'validate-'));
+  run('tar', ['-xzf', tarball, '-C', extractDir]);
+
+  const packageJsonFile = path.join(extractDir, 'package', 'package.json');
+  if (!fs.existsSync(packageJsonFile)) {
+    fail(`Packed tarball does not contain package/package.json for ${pkg.key}: ${tarball}`);
+  }
+
+  const packageJson = readJson(packageJsonFile);
+  const actualName = String(packageJson.name || '');
+  const actualVersion = String(packageJson.version || '');
+  if (actualName !== pkg.name || actualVersion !== pkg.version) {
+    fail(`Packed tarball mismatch for ${pkg.key}: package/package.json contains ${actualName}@${actualVersion}`);
+  }
+}
+
 function validateResolvedEngines(packages, options) {
   const mismatches = [];
   const unsupported = [];
@@ -1012,6 +1029,9 @@ function writeBundleReadme(bundleDir, options) {
     '  artifactory-upload-manifest.tsv Tab-separated name/version/tarball manifest.',
     '  tarballs/                       Packed npm tarballs ready to publish.',
     '  state/                          Snapshot of the local per-node-version state file.',
+    '',
+    'Every tarball was validated during download to confirm package/package.json',
+    'contains the expected package name and version.',
     '',
     'Tarball package.json files are normalized by default: scripts and devDependencies are removed.',
     'Runtime fields and dependencies are preserved unless strip flags were used.'
@@ -1161,6 +1181,7 @@ function main() {
       } else {
         fs.copyFileSync(packed.rawTarball, finalTarball);
       }
+      validatePackageTarball(pkg, finalTarball, workRoot);
 
       const stat = fs.statSync(finalTarball);
       manifestItems.push({
@@ -1179,6 +1200,7 @@ function main() {
         engineCompatible: pkg.engineCompatible,
         engineRangeSupported: pkg.engineRangeSupported,
         normalized: options.normalizeLibraryPackage,
+        packageJsonValidated: true,
         root: rootPackages.some((root) => root.name === pkg.name && root.resolvedVersion === pkg.version),
         optional: pkg.optional,
         dev: pkg.dev,

@@ -154,7 +154,8 @@ npm-artifactory-bundle-node-v20.11.1-.../
 
 `packages.jsonl` is usually the easiest uploader input: one JSON object per
 resolved package version, including name, version, tarball path, hashes, size,
-engine metadata, and whether it was a root request.
+engine metadata, whether it was a root request, and whether the packed tarball's
+`package/package.json` was validated.
 
 `artifactory-upload-manifest.tsv` is the minimal uploader input:
 
@@ -192,15 +193,16 @@ Required upload tools on the airgapped machine:
 - `tar`
 - GNU-compatible `sort -V`
 
+The uploader checks that every manifest tarball path exists, then publishes
+those already-packed tarballs. npm package validation happens on the
+internet-connected downloader side: every tarball is checked after `npm pack`
+to confirm `package/package.json` contains the expected package name and
+version.
+
 The uploader always passes an explicit npm dist-tag. It does not rely on
 `npm publish` defaults. It also treats already-published versions as success by
 default so reruns of large bundles can continue making progress. Use
 `--no-skip-existing` for strict conflict handling.
-
-Before publishing, the uploader validates every manifest tarball path and
-confirms each tarball contains `package/package.json` with the expected package
-name and version. If that check fails, the manifest is pointing at the wrong
-file or the tarball is not an npm package produced by `npm pack`.
 
 Default `latest` handling uses `--latest-policy computed`:
 

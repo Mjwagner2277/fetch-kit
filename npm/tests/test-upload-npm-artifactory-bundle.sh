@@ -77,22 +77,6 @@ make_bundle() {
   printf '%s\n' "${tmp}/${name}.tar"
 }
 
-make_bad_bundle() {
-  local name="$1"
-  local bundle_dir="${tmp}/${name}"
-  local tarball_dir="${bundle_dir}/tarballs"
-  local manifest="${bundle_dir}/packages.jsonl"
-  mkdir -p "$tarball_dir"
-  printf 'not a valid npm package tarball\n' > "${tarball_dir}/bad-pkg-1.0.0.tgz"
-  jq -c -n \
-    --arg name "bad-pkg" \
-    --arg version "1.0.0" \
-    --arg tarball "tarballs/bad-pkg-1.0.0.tgz" \
-    '{name: $name, version: $version, package: ($name + "@" + $version), tarball: $tarball}' > "$manifest"
-  tar -cf "${tmp}/${name}.tar" -C "$tmp" "$name"
-  printf '%s\n' "${tmp}/${name}.tar"
-}
-
 fake_npm="${tmp}/fake-npm.js"
 cat > "$fake_npm" <<'JS'
 #!/usr/bin/env node
@@ -140,24 +124,6 @@ JS
 chmod +x "$fake_npm"
 
 log_file="${tmp}/npm.log"
-: > "$log_file"
-
-bad_bundle="$(make_bad_bundle bundle-bad)"
-set +e
-bad_output="$(
-  FAKE_NPM_LOG="$log_file" bash "$uploader" \
-    --bundle-tar "$bad_bundle" \
-    --registry-url "https://registry.example.invalid/npm/" \
-    --token "test-token" \
-    --npm-bin "$fake_npm" \
-    --latest-policy "never" \
-    --dry-run 2>&1
-)"
-bad_status=$?
-set -e
-[[ "$bad_status" -ne 0 ]] || fail "invalid package tarball should fail preflight"
-printf '%s\n' "$bad_output" | grep -q 'does not contain package/package.json' \
-  || fail "invalid package tarball error was not clear"
 : > "$log_file"
 
 main_bundle="$(make_bundle bundle-main \
