@@ -31,6 +31,8 @@ const json = (file, value) => {
   }
 };
 const INCOMPLETE = 'npm-bundle.INCOMPLETE';
+const DOWNLOAD_STATE = 'download-state.json';
+const resolutionKey = (edge) => JSON.stringify([edge.from, edge.kind, edge.name, edge.installName, edge.requested]);
 
 class CompatibilityError extends Error {}
 
@@ -62,6 +64,7 @@ The local Node runtime may be older than the target. No npm CLI is required.
   --tar-file FILE              New uncompressed transfer TAR (no overwrite)
   --cache-dir DIR              Verified source cache (default OUTPUT-DIR.cache)
   --resume                     Resume an incomplete output directory
+  --update                     Add package requests to an existing bundle
   --help                      Show this help
 
 Bare roots and @latest select the highest stable version compatible with the
@@ -72,8 +75,13 @@ are fatal. Unspecified platform dimensions are unfiltered, never host-derived.
 Scripts/private/publishConfig/devDependencies are removed from package copies.
 No npmrc is read. Source credentials are scoped to the configured registry.
 Downloads and progress are saved as the run proceeds. After an error, rerun
-the same command with --resume to reuse verified downloads. Only complete
-dependency closures produce a publishable bundle and transfer TAR.
+the same command with --resume to reuse verified downloads. Use --update and
+a new --tar-file to extend an existing bundle; previous roots are retained.
+download-state.json remembers requests, cache location, and verified downloads.
+Registry metadata is refreshed; matching cached tarballs are not downloaded.
+Updates preserve previous selections; add an explicit version to include a new
+version of an existing root. State belongs to the requested target Node/platform.
+Only complete dependency closures produce a publishable bundle and transfer TAR.
 `;
 }
 
@@ -97,6 +105,7 @@ function parseArgs(argv, env = process.env) {
     if (arg === '--no-ssl') { options.strictSsl = false; continue; }
     if (arg === '--include-dev-dependencies') { options.includeDevDependencies = true; continue; }
     if (arg === '--resume') { options.resume = true; continue; }
+    if (arg === '--update') { options.update = true; continue; }
     if (arg === '--') { options.packageSpecs.push(...argv.slice(index + 1)); break; }
     if (own(flags, arg) || arg === '--package' || arg === '--packages-file') {
       const value = argv[++index];
@@ -110,6 +119,7 @@ function parseArgs(argv, env = process.env) {
     options.packageSpecs.push(arg);
   }
   if (options.help) return options;
+  if (options.resume && options.update) throw new Error('Choose --resume or --update, not both');
   options.nodeVersion = semver.valid(options.nodeVersion || '');
   if (!options.nodeVersion) throw new Error('--node-version requires a full target version, e.g. 24.0.0');
   options.registryUrl = checkedUrl(options.registry);
@@ -121,31 +131,49 @@ function parseArgs(argv, env = process.env) {
   if (options.token && options.username) throw new Error('Choose token or basic source authentication, not both');
   if (options.caFile) options.ca = [...tls.rootCertificates, fs.readFileSync(path.resolve(options.caFile))];
   options.packageSpecs.push(...options.packagesFiles.flatMap(readPackagesFile));
-  if (!options.packageSpecs.length) throw new Error('Supply at least one --package, --packages-file, or positional package');
+  if (!options.packageSpecs.length && !options.resume && !options.update) throw new Error('Supply at least one --package, --packages-file, or positional package');
   options.packageSpecs.forEach((spec) => parseRequest(spec));
+  options.packageSpecs = [...new Set(options.packageSpecs)];
   const defaultName = `npm-http-bundle-node-v${options.nodeVersion}`;
   options.tarFile = path.resolve(options.tarFile || `${defaultName}.tar`);
   options.outputDir = path.resolve(options.outputDir || options.tarFile.replace(/\.tar$/i, '') + (options.tarFile.endsWith('.tar') ? '' : '-bundle'));
-  options.cacheDir = path.resolve(options.cacheDir || `${options.outputDir}.cache`);
-  if (isWithinDirectory(options.outputDir, options.tarFile)) throw new Error('--tar-file must be outside --output-dir');
-  if (isWithinDirectory(options.outputDir, options.cacheDir) || isWithinDirectory(options.cacheDir, options.outputDir)) throw new Error('--cache-dir and --output-dir must be separate directories');
-  if (isWithinDirectory(options.cacheDir, options.tarFile)) throw new Error('--tar-file must be outside --cache-dir');
   options.resumeProfile = {
     nodeVersion: options.nodeVersion, registry: options.registry,
     targetOs: options.targetOs, targetArch: options.targetArch, targetLibc: options.targetLibc,
     includeDevDependencies: options.includeDevDependencies, packageSpecs: options.packageSpecs
   };
   if (fs.existsSync(options.outputDir)) {
-    if (!options.resume) throw new Error(`Output directory already exists: ${options.outputDir}. Use --resume for an incomplete run.`);
-    if (fs.lstatSync(options.outputDir).isSymbolicLink() || !fs.statSync(options.outputDir).isDirectory()) throw new Error('--resume requires a real bundle directory');
-    if (!fs.existsSync(path.join(options.outputDir, INCOMPLETE))) throw new Error('Output is already complete or is not a resumable HTTP bundle; use a new --output-dir');
+    if (!options.resume && !options.update) throw new Error(`Output directory already exists: ${options.outputDir}. Use --resume for an incomplete run or --update to add packages.`);
+    if (fs.lstatSync(options.outputDir).isSymbolicLink() || !fs.statSync(options.outputDir).isDirectory()) throw new Error('--resume/--update requires a real bundle directory');
+    if (options.resume && !fs.existsSync(path.join(options.outputDir, INCOMPLETE))) throw new Error('Output is already complete or is not a resumable HTTP bundle; use --update to extend it');
     let previous;
-    try { previous = JSON.parse(fs.readFileSync(path.join(options.outputDir, 'summary.json'), 'utf8')); }
-    catch (_) { throw new Error('Cannot read the incomplete bundle summary for --resume'); }
-    if (previous.inputMode !== 'http-package-list' || JSON.stringify(previous.resumeProfile) !== JSON.stringify(options.resumeProfile)) throw new Error('--resume requires the same package requests, source registry, target Node/platform, and dependency options');
-  } else if (options.resume) {
-    throw new Error('--resume output directory does not exist; omit --resume for a new run');
+    const stateFile = path.join(options.outputDir, DOWNLOAD_STATE);
+    // Older HTTP bundles have the same profile in summary.json. Their existing
+    // source cache is reusable, and the first update adds the explicit state.
+    const previousFile = fs.existsSync(stateFile) ? stateFile : path.join(options.outputDir, 'summary.json');
+    try { previous = JSON.parse(fs.readFileSync(previousFile, 'utf8')); }
+    catch (_) { throw new Error('Cannot read the existing HTTP bundle state/summary for --resume/--update'); }
+    const profile = previous && previous.resumeProfile;
+    if (!previous || previous.inputMode !== 'http-package-list' || !profile || !Array.isArray(profile.packageSpecs) || !profile.packageSpecs.length ||
+        (previousFile === stateFile && (previous.schemaVersion !== 1 || !Array.isArray(previous.packages)))) {
+      throw new Error('Existing directory does not contain supported HTTP bundle download state');
+    }
+    profile.packageSpecs.forEach((spec) => parseRequest(spec));
+    for (const key of ['nodeVersion', 'registry', 'targetOs', 'targetArch', 'targetLibc', 'includeDevDependencies']) {
+      if (profile[key] !== options.resumeProfile[key]) throw new Error('--resume/--update requires the same source registry, target Node/platform, and dependency options; use a new output directory with --cache-dir to reuse downloads for a different target');
+    }
+    if (options.resume && options.packageSpecs.some((spec) => !profile.packageSpecs.includes(spec))) throw new Error('--resume cannot add package requests; use --update to extend the bundle');
+    options.packageSpecs = [...new Set([...profile.packageSpecs, ...options.packageSpecs])];
+    options.resumeProfile.packageSpecs = options.packageSpecs;
+    options.previousDownloadState = previous;
+    options.cacheDir = options.cacheDir || previous.cacheDir;
+  } else if (options.resume || options.update) {
+    throw new Error('--resume/--update output directory does not exist; omit the flag for a new run');
   }
+  options.cacheDir = path.resolve(options.cacheDir || `${options.outputDir}.cache`);
+  if (isWithinDirectory(options.outputDir, options.tarFile)) throw new Error('--tar-file must be outside --output-dir');
+  if (isWithinDirectory(options.outputDir, options.cacheDir) || isWithinDirectory(options.cacheDir, options.outputDir)) throw new Error('--cache-dir and --output-dir must be separate directories');
+  if (isWithinDirectory(options.cacheDir, options.tarFile)) throw new Error('--tar-file must be outside --cache-dir');
   if (fs.existsSync(options.tarFile)) throw new Error(`Transfer TAR already exists: ${options.tarFile}`);
   return options;
 }
@@ -500,10 +528,58 @@ function progressSummary(options, state, status, error) {
     hostNodeVersion: process.version, registry: options.registry,
     targetPlatform: { os: options.targetOs, arch: options.targetArch, libc: options.targetLibc },
     outputDir: options.outputDir, cacheDir: options.cacheDir, transferTarFile: options.tarFile,
+    downloadStateFile: path.join(options.outputDir, DOWNLOAD_STATE),
     packageCount: state.packageCount || 0, sourceDownloadCount: state.downloads,
     reusedDownloadCount: state.cacheHits, updatedAt: new Date().toISOString(),
     ...(error ? { error: safeError(error, options) } : {})
   };
+}
+
+function saveDownloadState(options, state, status, error) {
+  json(path.join(options.outputDir, DOWNLOAD_STATE), {
+    schemaVersion: 1, inputMode: 'http-package-list', status,
+    closureComplete: status === 'complete' || status === 'archive-failed',
+    resumeProfile: options.resumeProfile, cacheDir: options.cacheDir,
+    targetNodeVersion: options.nodeVersion,
+    targetPlatform: { os: options.targetOs, arch: options.targetArch, libc: options.targetLibc },
+    transferTarFile: options.tarFile, updatedAt: new Date().toISOString(),
+    sourceDownloadCount: state.downloads, reusedDownloadCount: state.cacheHits,
+    packages: [...state.cachedPackages.values()],
+    preserveSelections: state.preserveSelections, resolutions: [...state.resolutions.values()],
+    ...(error ? { error: safeError(error, options) } : {})
+  });
+}
+
+function previousResolutions(options) {
+  const previous = options.previousDownloadState;
+  if (!previous) return [];
+  if (Array.isArray(previous.resolutions)) return previous.resolutions;
+  // Migrate selections from bundles created before download-state.json.
+  const packages = new Map();
+  const resolutions = new Map();
+  for (const name of ['packages.json', 'partial-packages.json']) {
+    const file = path.join(options.outputDir, name);
+    if (!fs.existsSync(file)) continue;
+    const entries = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const entry of entries) packages.set(entry.package, entry);
+  }
+  for (const name of ['dependency-graph.json', 'partial-dependency-graph.json']) {
+    const file = path.join(options.outputDir, name);
+    if (!fs.existsSync(file)) continue;
+    const graph = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const edge of graph.edges) {
+      const entry = packages.get(edge.to);
+      if (edge.omitted) resolutions.set(resolutionKey(edge), {
+        from: edge.from, kind: edge.kind, name: edge.name, installName: edge.installName,
+        requested: edge.requested, omitted: true, reason: edge.reason
+      });
+      else if (!edge.bundled && entry) resolutions.set(resolutionKey(edge), {
+        from: edge.from, kind: edge.kind, name: edge.name, installName: edge.installName,
+        requested: edge.requested, version: entry.version, integrity: entry.registryIntegrity
+      });
+    }
+  }
+  return [...resolutions.values()];
 }
 
 async function buildBundle(options, stage, state) {
@@ -522,6 +598,7 @@ async function buildBundle(options, stage, state) {
 
   state.checkpoint = (status = 'resolving', error) => {
     state.packageCount = published.size;
+    saveDownloadState(options, state, status, error);
     json(path.join(stage, 'partial-packages.json'), [...published.values()]);
     json(path.join(stage, 'partial-dependency-graph.json'), {
       schemaVersion: 1, resolutionModel: RESOLUTION_MODEL, closureComplete: false,
@@ -544,9 +621,8 @@ async function buildBundle(options, stage, state) {
     return metadataCache.get(name);
   }
 
-  async function archiveFor(name, version, metadata) {
+  async function archiveFor(name, version, metadata, expectedIntegrity) {
     const key = `${name}@${version}`;
-    if (archiveCache.has(key)) return archiveCache.get(key);
     if ((metadata.name && metadata.name !== name) || (metadata.version && metadata.version !== version)) throw new Error(`Registry version metadata identity mismatch for ${key}`);
     const dist = metadata.dist || {};
     if (!dist.tarball) throw new Error(`Registry metadata lacks dist.tarball for ${key}`);
@@ -554,6 +630,8 @@ async function buildBundle(options, stage, state) {
     let registryIntegrity = dist.integrity;
     if (!registryIntegrity && typeof dist.shasum === 'string' && /^[a-fA-F0-9]{40}$/.test(dist.shasum)) registryIntegrity = `sha1-${Buffer.from(dist.shasum, 'hex').toString('base64')}`;
     if (!registryIntegrity) throw new Error(`Registry metadata lacks a supported integrity/shasum for ${key}; refusing an unverified download`);
+    if (expectedIntegrity && registryIntegrity !== expectedIntegrity) throw new Error(`Source integrity changed for previously selected ${key}; refusing to replace an existing version during an update`);
+    if (archiveCache.has(key)) return archiveCache.get(key);
     const cacheKey = crypto.createHash('sha256').update(JSON.stringify([options.registry, name, version, registryIntegrity])).digest('hex');
     const raw = path.join(options.cacheDir, `${cacheKey}.tgz`);
     let manifests;
@@ -568,6 +646,7 @@ async function buildBundle(options, stage, state) {
         // Preserve rejected bytes for diagnosis without presenting them as a
         // usable tarball. Fresh metadata and the source digest remain required.
         fs.renameSync(raw, `${raw}.invalid-${crypto.randomBytes(6).toString('hex')}`);
+        state.cachedPackages.delete(cacheKey);
         log(`Cached download failed validation; downloading again: ${key}`);
       }
     }
@@ -581,6 +660,15 @@ async function buildBundle(options, stage, state) {
       state.downloads += 1;
       json(path.join(options.cacheDir, `${cacheKey}.json`), { name, version, registry: options.registry, integrity: registryIntegrity, tarball: `${cacheKey}.tgz` });
     }
+    // Commit an explicit reusable inventory as each archive becomes durable.
+    // It is an index, not a reason to trust bytes: reuse above always rechecks
+    // the registry digest and archive identity, even when this record exists.
+    state.cachedPackages.set(cacheKey, {
+      name, version, registry: options.registry, integrity: registryIntegrity,
+      cacheKey, tarball: `${cacheKey}.tgz`, bytes: fs.statSync(raw).size,
+      verifiedAt: new Date().toISOString()
+    });
+    saveDownloadState(options, state, 'resolving');
     const result = { key, name, version, raw, manifests, manifest: manifests.get('package/package.json'), registryIntegrity, resolved: printableUrl(tarballUrl) };
     archiveCache.set(key, result);
     return result;
@@ -640,18 +728,47 @@ async function buildBundle(options, stage, state) {
         recordTagNormalization(request, manifest.version);
         continue;
       }
+      const pinned = state.pinnedResolutions.get(resolutionKey(edge));
+      if (pinned && pinned.omitted) {
+        if (!request.optional) throw new Error(`Saved omission is not optional: ${request.name}@${request.requested}`);
+        edge.omitted = true;
+        edge.reason = pinned.reason;
+        omissions.push(edge);
+        edges.push(edge);
+        log(`Preserving optional target omission: ${request.from} -> ${request.name}@${request.requested}`);
+        continue;
+      }
       const metadata = await metadataFor(request.name);
       const rejected = new Map();
       let archive;
       while (true) {
-        const version = selectVersion(metadata, request, options, rejected);
-        archive = await archiveFor(request.name, version, metadata.versions[version]);
+        let version;
+        if (pinned) {
+          // Exact saved identities must not pass through SemVer range matching:
+          // build metadata is ignored in precedence (1.0.0+a equals 1.0.0+b).
+          version = pinned.version;
+          const range = semver.validRange(request.requested);
+          if (range && !semver.satisfies(version, range)) throw new Error(`Saved ${request.name}@${version} does not satisfy ${request.requested}`);
+          if (!metadata.versions || !own(metadata.versions, version)) throw new Error(`Previously selected ${request.name}@${version} is no longer available in registry metadata`);
+          if (!metadata.versions[version] || typeof metadata.versions[version] !== 'object' || Array.isArray(metadata.versions[version])) throw new Error(`Invalid version metadata for ${request.name}@${version}`);
+          const reason = incompatibility(metadata.versions[version], options);
+          if (reason) throw new Error(`Previously selected ${request.name}@${version} is incompatible with the saved target: ${reason}`);
+        } else {
+          version = selectVersion(metadata, request, options, rejected);
+        }
+        archive = await archiveFor(request.name, version, metadata.versions[version], pinned && pinned.integrity);
         const reason = incompatibility(archive.manifest, options);
         if (!reason) break;
+        if (pinned) throw new Error(`Previously selected ${archive.key} archive is incompatible with the saved target: ${reason}`);
         rejected.set(version, `archive manifest: ${reason}`);
       }
       edge.to = archive.key;
       edges.push(edge);
+      const selection = { from: edge.from, kind: edge.kind, name: edge.name,
+        installName: edge.installName, requested: edge.requested,
+        version: archive.version, integrity: archive.registryIntegrity };
+      state.resolutions.set(resolutionKey(edge), selection);
+      if (state.preserveSelections) state.pinnedResolutions.set(resolutionKey(edge), selection);
       recordTagNormalization(request, archive.version);
       if (request.kind === 'root') roots.push({ name: request.name, installName: request.installName, requested: request.requested, spec: `${request.installName}@${request.originalRequested}`, resolvedVersion: archive.version, resolvedSpec: archive.key });
       if (!published.has(archive.key)) {
@@ -691,6 +808,10 @@ async function buildBundle(options, stage, state) {
         edge.reason = error.message;
         omissions.push(edge);
         edges.push(edge);
+        const omission = { from: edge.from, kind: edge.kind, name: edge.name,
+          installName: edge.installName, requested: edge.requested, omitted: true, reason: edge.reason };
+        state.resolutions.set(resolutionKey(edge), omission);
+        if (state.preserveSelections) state.pinnedResolutions.set(resolutionKey(edge), omission);
         log(`OPTIONAL TARGET OMISSION: ${request.from} -> ${request.name}@${request.requested}: ${error.message}`);
         continue;
       }
@@ -725,6 +846,7 @@ async function buildBundle(options, stage, state) {
   const summary = {
     schemaVersion: 1, inputMode: 'http-package-list', resolutionModel: RESOLUTION_MODEL,
     status: 'complete', resumeProfile: options.resumeProfile, cacheDir: options.cacheDir,
+    downloadStateFile: path.join(options.outputDir, DOWNLOAD_STATE),
     sourceDownloadCount: state.downloads, reusedDownloadCount: state.cacheHits,
     closureComplete: true, nodeVersion: options.nodeVersion, targetNodeVersion: options.nodeVersion,
     hostNodeVersion: process.version, registry: options.registry, strictSsl: options.strictSsl,
@@ -748,8 +870,33 @@ async function main(argv = process.argv.slice(2), env = process.env) {
   const options = parseArgs(argv, env);
   if (options.help) { process.stdout.write(help()); return; }
   if (!options.strictSsl) log('WARNING: TLS certificate verification is explicitly disabled.');
-  const state = { downloads: 0, cacheHits: 0, priorTarballs: new Set() };
-  if (options.resume) {
+  const state = { downloads: 0, cacheHits: 0, priorTarballs: new Set(), cachedPackages: new Map(),
+    resolutions: new Map(), pinnedResolutions: new Map(), preserveSelections: false };
+  const previousState = options.previousDownloadState;
+  state.preserveSelections = !!(options.update || (previousState && previousState.preserveSelections));
+  if (state.preserveSelections) {
+    for (const entry of previousResolutions(options)) {
+      if (!entry || (entry.from !== null && typeof entry.from !== 'string') ||
+          !['root', 'dependencies', 'optionalDependencies', 'peerDependencies', 'devDependencies'].includes(entry.kind) ||
+          typeof entry.name !== 'string' || typeof entry.installName !== 'string' || typeof entry.requested !== 'string' ||
+          (entry.omitted ? (entry.omitted !== true || entry.kind === 'root' || typeof entry.reason !== 'string') :
+            (!canonicalVersion(entry.version) || typeof entry.integrity !== 'string'))) throw new Error('Invalid saved dependency selection in HTTP bundle state');
+      state.pinnedResolutions.set(resolutionKey(entry), entry);
+      state.resolutions.set(resolutionKey(entry), entry);
+    }
+  }
+  if (previousState && previousState.cacheDir === options.cacheDir && Array.isArray(previousState.packages)) {
+    for (const entry of previousState.packages) {
+      if (entry && /^[a-f0-9]{64}$/.test(entry.cacheKey) && entry.tarball === `${entry.cacheKey}.tgz` &&
+          entry.registry === options.registry && typeof entry.name === 'string' && typeof entry.version === 'string' && typeof entry.integrity === 'string') {
+        state.cachedPackages.set(entry.cacheKey, {
+          name: entry.name, version: entry.version, registry: entry.registry, integrity: entry.integrity,
+          cacheKey: entry.cacheKey, tarball: entry.tarball, bytes: entry.bytes, verifiedAt: entry.verifiedAt
+        });
+      }
+    }
+  }
+  if (options.resume || options.update) {
     for (const name of ['partial-packages.json', 'packages.json']) {
       try {
         const entries = JSON.parse(fs.readFileSync(path.join(options.outputDir, name), 'utf8'));
@@ -768,7 +915,7 @@ async function main(argv = process.argv.slice(2), env = process.env) {
     }
   }
   fs.mkdirSync(path.dirname(options.outputDir), { recursive: true });
-  if (!options.resume) fs.mkdirSync(options.outputDir);
+  if (!options.resume && !options.update) fs.mkdirSync(options.outputDir);
   const incompleteFile = path.join(options.outputDir, INCOMPLETE);
   fs.writeFileSync(incompleteFile, 'Dependency resolution is incomplete. Do not publish this directory. Rerun the same downloader command with --resume.\n');
   let complete = false;
@@ -776,7 +923,10 @@ async function main(argv = process.argv.slice(2), env = process.env) {
   let temporaryTar;
   log(`Live package directory: ${options.outputDir}`);
   log(`Verified source cache: ${options.cacheDir}`);
+  log(`Persistent download state: ${path.join(options.outputDir, DOWNLOAD_STATE)}`);
+  if (options.update) log(`Updating cumulative bundle: ${options.packageSpecs.length} root requests. Refreshing metadata; verified cached tarballs will be reused.`);
   try {
+    saveDownloadState(options, state, 'resolving');
     json(path.join(options.outputDir, 'summary.json'), progressSummary(options, state, 'resolving'));
     // A prior interrupted finalization may have written some complete-manifest
     // files. The marker remains in place throughout this fresh graph walk.
@@ -788,6 +938,7 @@ async function main(argv = process.argv.slice(2), env = process.env) {
     fs.mkdirSync(options.cacheDir, { recursive: true });
     if (fs.lstatSync(options.cacheDir).isSymbolicLink()) throw new Error('--cache-dir must be a real directory');
     summary = await buildBundle(options, options.outputDir, state);
+    saveDownloadState(options, state, 'complete');
     for (const name of ['partial-packages.json', 'partial-dependency-graph.json']) fs.rmSync(path.join(options.outputDir, name), { force: true });
     // Remove this last: until now the publisher must reject even a directory
     // whose manifests happened to be written before interruption.
@@ -805,10 +956,12 @@ async function main(argv = process.argv.slice(2), env = process.env) {
   } catch (error) {
     try {
       if (complete) {
+        saveDownloadState(options, state, 'archive-failed', error);
         json(path.join(options.outputDir, 'summary.json'), { ...summary, status: 'archive-failed', error: safeError(error, options) });
       } else if (state.checkpoint) {
         state.checkpoint('failed', error);
       } else {
+        saveDownloadState(options, state, 'failed', error);
         json(path.join(options.outputDir, 'summary.json'), progressSummary(options, state, 'failed', error));
       }
     } catch (reportError) {
@@ -818,7 +971,7 @@ async function main(argv = process.argv.slice(2), env = process.env) {
       log(`Transfer archive failed; the complete prepared directory is retained and can be published with --bundle-dir: ${options.outputDir}`);
     } else {
       log(`Downloaded packages and partial inventory retained: ${options.outputDir}`);
-      log('The dependency graph is INCOMPLETE. Fix the error, then rerun the same command with --resume; verified downloads will be reused.');
+      log('The dependency graph is INCOMPLETE. Fix the error, then retry with --resume (or --update to add packages); verified downloads will be reused.');
     }
     throw new Error(safeError(error, options));
   } finally {

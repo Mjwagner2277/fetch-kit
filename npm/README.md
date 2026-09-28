@@ -85,6 +85,7 @@ npm-node24-bundle/
   partial-packages.json            # running package inventory
   partial-dependency-graph.json    # selected roots and resolved edges so far
   summary.json                    # counts, target, status and last error
+  download-state.json             # target, cumulative requests, selections, cache inventory
   npm-bundle.INCOMPLETE            # present until resolution and preparation finish
 npm-node24-bundle.cache/           # verified original source archives for reuse
 ```
@@ -93,9 +94,10 @@ An error or interruption keeps these downloads and progress files. To retry,
 rerun the same command with **`--resume`**. The source registry metadata is
 fetched again, and cached tarballs are rechecked against its checksum and package
 identity before reuse. A corrupt cache entry is downloaded again. Resume requires
-the same package requests, registry, target Node/platform, and dependency options;
-credentials can be corrected. Resume rebuilds the graph and sanitized copies;
-old selections are removed from the prepared set only after successful resolution,
+the same registry, target Node/platform, and dependency options; credentials can
+be corrected. Package arguments may be omitted to use the stored requests, or
+may repeat existing requests; use `--update` to add new requests. Resume rebuilds
+the graph and sanitized copies. Old selections are removed from the prepared set only after successful resolution,
 while their original downloads remain cached. Run one downloader per output
 directory at a time.
 
@@ -106,8 +108,58 @@ node .\npm\download-npm-http-bundle.js --node-version 24.0.0 --target-os linux -
 Use `--cache-dir PATH` to choose another persistent cache location outside the
 output directory. This cache contains original archives and is not the prepared
 publishing bundle. The default cache is `<output-dir>.cache` and is kept after
-success too. Old versions of this script deleted temporary downloads on failure;
-they cannot supply this new resume state, so their failed runs need a fresh run.
+success too. Resume and update remember a previously supplied custom cache path
+unless you explicitly select another `--cache-dir`. Old versions of this script
+deleted temporary downloads on failure; they cannot supply this new resume state,
+so their failed runs need a fresh run.
+
+### Add packages to an existing bundle
+
+Use **`--update`** with the same output directory and a **new transfer TAR path**.
+It works for completed bundles and interrupted runs. You can supply just the
+additions or an expanded package list; saved root requests are retained and
+duplicates are ignored. For example, after creating `npm-node24-bundle` above:
+
+```powershell
+node .\npm\download-npm-http-bundle.js --node-version 24.0.0 --target-os linux --target-arch x64 --target-libc glibc --package axios --output-dir .\npm-node24-bundle --tar-file .\npm-node24-bundle-v2.tar --update
+```
+
+`download-state.json` is saved as each source archive is verified. It records the
+requested Node version, platform, registry, cumulative package requests, selected
+versions, cache location, and original-archive checksums. It belongs to that exact
+**requested Node version**, independently of the Node runtime running the script.
+Using the directory with a different Node version, OS, architecture, libc, source
+registry, or dependency option is rejected before changing existing files.
+
+For another Node target, use a separate output directory and transfer TAR. You
+may point both targets at the same `--cache-dir`: original source bytes can be
+reused, but each target gets its own state, dependency selections, compatibility
+checks, and prepared package copies. An archive is never accepted solely because
+the state file says it was downloaded; its checksum and package identity are
+verified again. Keep the cache directory alongside the state for download reuse.
+
+Updates preserve previous root and dependency selections and optional omissions,
+including tags rewritten inside sanitized archives, and resolve new requests
+against fresh registry metadata.
+This avoids changing the bytes of an existing package version merely because a
+source tag moved. To add a newer version, request it explicitly, such as
+`--package react@19.0.0`; previously requested versions remain included. To refresh
+all ranges and tags, start a new output directory using the shared cache.
+Metadata HTTP requests still occur during update, but unchanged verified package
+tarballs are reused. Each run reports `sourceDownloadCount` and
+`reusedDownloadCount` so these cases are visible.
+
+If an update fails, its accumulated requests and selections remain in the state.
+Rerun it with `--update`, or use `--resume` with the same target options and no
+package arguments. Earlier complete transfer TARs remain unchanged. The live
+directory is marked incomplete until the expanded graph finishes; use a fresh
+TAR filename for every successful generation. Existing archives are never
+overwritten. Bundles from the preceding HTTP downloader version are migrated
+from their saved summary and dependency graph automatically. The state and
+original cache stay on the connected machine; the transfer TAR contains only
+the prepared publishing bundle.
+
+### Publish the completed bundle
 
 The Python uploader refuses inputs containing `npm-bundle.INCOMPLETE`, including
 direct selection of its `tarballs/` subdirectory. Do not remove the marker to

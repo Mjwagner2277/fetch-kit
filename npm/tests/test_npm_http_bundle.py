@@ -208,6 +208,12 @@ Module._load = function (name, ...args) {
     def graph(self):
         return json.loads((self.output / "dependency-graph.json").read_text())
 
+    def download_state(self):
+        return json.loads((self.output / "download-state.json").read_text())
+
+    def source_request_count(self, route):
+        return sum(item["path"] == route for item in self.source.requests)
+
     def assert_incomplete(self, status="failed"):
         self.assertTrue(self.output.is_dir(), "Downloaded progress must survive a resolution failure")
         self.assertTrue((self.output / "npm-bundle.INCOMPLETE").is_file())
@@ -523,6 +529,7 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
                     "metadata": [archive_metadata((self.output / item["tarball"]).read_bytes())
                                  for item in entries],
                     "summary": json.loads((self.output / "summary.json").read_text()),
+                    "state": self.download_state(),
                     "graph": json.loads((self.output / "partial-dependency-graph.json").read_text()),
                     "incomplete": (self.output / "npm-bundle.INCOMPLETE").is_file(),
                     "final_manifest": (self.output / "packages.json").exists(),
@@ -539,6 +546,12 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
             self.assertEqual([(item["name"], item["version"]) for item in observed["entries"]],
                              [("app", "1.0.0")])
             self.assertEqual(observed["summary"]["status"], "resolving")
+            self.assertEqual(observed["state"]["schemaVersion"], 1)
+            self.assertEqual(observed["state"]["inputMode"], "http-package-list")
+            saved_app = next(item for item in observed["state"]["packages"] if item["name"] == "app")
+            self.assertEqual(saved_app["version"], "1.0.0")
+            for field in ("integrity", "cacheKey", "tarball"):
+                self.assertTrue(saved_app[field], "Incremental state must retain " + field)
             self.assertFalse(observed["summary"]["closureComplete"])
             self.assertFalse(observed["graph"]["closureComplete"])
             self.assertTrue(observed["incomplete"])
@@ -635,6 +648,264 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
         self.assertTrue(any(file.read_bytes() == original_bytes for file in cache.rglob("*.tgz")),
                         "Removing an obsolete prepared package must retain its reusable source cache")
         self.assert_archive_valid()
+
+    def test_update_complete_bundle_merges_roots_reuses_cache_and_adds_explicit_versions(self):
+        custom_cache = self.root / "custom source cache"
+        app = self.source.add("app", metadata={"dependencies": {"shared": "1.0.0"}})
+        shared = self.source.add("shared")
+        app_route = unquote(urlsplit(app["dist"]["tarball"]).path)
+        shared_route = unquote(urlsplit(shared["dist"]["tarball"]).path)
+        self.download(["app"], "--cache-dir", str(custom_cache))
+        first_tar = self.transfer
+        first_tar_bytes = first_tar.read_bytes()
+        self.source.add("extra", metadata={"dependencies": {"shared": "1.0.0"}})
+        self.transfer = self.root / "transfer-extended.tar"
+        self.download(["extra"], "--update")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("shared", "1.0.0"), ("extra", "1.0.0")})
+        state = self.download_state()
+        self.assertEqual(set(state["resumeProfile"]["packageSpecs"]), {"app", "extra"})
+        self.assertEqual(Path(state["cacheDir"]), custom_cache)
+        self.assertEqual(self.source_request_count(app_route), 1)
+        self.assertEqual(self.source_request_count(shared_route), 1)
+        self.assertEqual(self.source_request_count("/source/app"), 2,
+                         "An incremental update must still consult fresh metadata")
+        self.assertEqual(first_tar.read_bytes(), first_tar_bytes)
+        self.assert_archive_valid()
+
+        # An expanded list must deduplicate roots and preserve prior selections
+        # even when the registry's latest channel has advanced.
+        self.source.add("app", "2.0.0", {"dependencies": {"shared": "1.0.0"}})
+        second_tar = self.transfer
+        second_tar_bytes = second_tar.read_bytes()
+        self.transfer = self.root / "transfer-refreshed.tar"
+        self.download(["app", "extra", "app"], "--update")
+        specs = self.download_state()["resumeProfile"]["packageSpecs"]
+        self.assertEqual(len(specs), 2)
+        self.assertEqual(set(specs), {"app", "extra"})
+        self.assertEqual(len(self.graph()["roots"]), 2)
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("shared", "1.0.0"), ("extra", "1.0.0")})
+        self.assertEqual(self.source_request_count(app_route), 1)
+        self.assertEqual(self.source_request_count(shared_route), 1)
+        self.assertEqual(first_tar.read_bytes(), first_tar_bytes)
+        self.assertEqual(second_tar.read_bytes(), second_tar_bytes)
+        self.assert_archive_valid()
+
+        # Requesting the newer version explicitly adds it alongside the old
+        # root, without redownloading their shared dependency.
+        self.transfer = self.root / "transfer-add-version.tar"
+        self.download(["app@2.0.0"], "--update")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("app", "2.0.0"),
+                                            ("shared", "1.0.0"), ("extra", "1.0.0")})
+        self.assertEqual(set(self.download_state()["resumeProfile"]["packageSpecs"]),
+                         {"app", "extra", "app@2.0.0"})
+        self.assertEqual(self.source_request_count(app_route), 1)
+        self.assertEqual(self.source_request_count(shared_route), 1)
+        self.assertEqual(first_tar.read_bytes(), first_tar_bytes)
+        self.assert_archive_valid()
+
+    def test_failed_update_and_resume_preserve_previously_normalized_dependency_tags(self):
+        self.source.add("child", "1.0.0")
+        self.source.add("app", metadata={"dependencies": {"child": "latest"}})
+        self.download(["app"])
+        app_entry = next(item for item in self.entries() if item["name"] == "app")
+        original_app_bytes = (self.output / app_entry["tarball"]).read_bytes()
+        original_app_hash = app_entry["sha512"]
+        self.source.add("child", "2.0.0")
+        self.source.add("extra", metadata={"dependencies": {"child": "latest", "missing": "1.0.0"}})
+        self.transfer = self.root / "transfer-pinned-update.tar"
+        self.download(["extra"], "--update", success=False)
+        partial = self.assert_incomplete()
+        self.assertIn(("child", "2.0.0"), {(item["name"], item["version"]) for item in partial})
+        self.assertTrue(self.download_state()["resolutions"])
+
+        # A retry of a failed extension must preserve both the original edge
+        # and the newly selected edge, even if latest changes a second time.
+        self.source.add("child", "3.0.0")
+        self.source.add("missing")
+        self.download([], "--resume")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("extra", "1.0.0"),
+                                            ("child", "1.0.0"), ("child", "2.0.0"), ("missing", "1.0.0")})
+        current_app = next(item for item in self.entries() if item["name"] == "app")
+        self.assertEqual(current_app["sha512"], original_app_hash)
+        self.assertEqual((self.output / current_app["tarball"]).read_bytes(), original_app_bytes,
+                         "Extending a bundle must not rewrite an already published package version")
+        for name, expected_child in (("app", "1.0.0"), ("extra", "2.0.0")):
+            entry = next(item for item in self.entries() if item["name"] == name)
+            manifest = archive_metadata((self.output / entry["tarball"]).read_bytes())
+            self.assertEqual(manifest["dependencies"]["child"], expected_child)
+        self.assert_archive_valid()
+
+    def test_update_partial_bundle_remembers_expanded_roots_and_cache_for_empty_resume(self):
+        custom_cache = self.root / "saved source cache"
+        app = self.source.add("app", metadata={"dependencies": {"missing": "1.0.0"}})
+        app_route = unquote(urlsplit(app["dist"]["tarball"]).path)
+        self.download(["app"], "--cache-dir", str(custom_cache), success=False)
+        self.assert_incomplete()
+        self.source.add("extra")
+        self.download(["extra"], "--update", success=False)
+        self.assert_incomplete()
+        state = self.download_state()
+        self.assertEqual(set(state["resumeProfile"]["packageSpecs"]), {"app", "extra"})
+        self.assertEqual(Path(state["cacheDir"]), custom_cache)
+        state_bytes = (self.output / "download-state.json").read_bytes()
+        requests_before = len(self.source.requests)
+        self.download(["new-root"], "--resume", success=False)
+        self.assertEqual((self.output / "download-state.json").read_bytes(), state_bytes)
+        self.assertEqual(len(self.source.requests), requests_before)
+
+        self.source.add("missing")
+        self.download([], "--resume")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("extra", "1.0.0"), ("missing", "1.0.0")})
+        self.assertEqual(self.source_request_count(app_route), 1)
+        self.assertEqual(Path(self.download_state()["cacheDir"]), custom_cache)
+        self.assert_archive_valid()
+
+    def test_update_profile_and_existing_tar_refusals_preserve_previous_bundle(self):
+        self.source.add("app")
+        self.download(["app"])
+        first_tar = self.transfer
+        first_tar_bytes = first_tar.read_bytes()
+
+        def saved_files():
+            return {file.relative_to(self.output).as_posix(): file.read_bytes()
+                    for file in self.output.rglob("*") if file.is_file()}
+
+        original = saved_files()
+        requests_before = len(self.source.requests)
+        incompatible = (("--node-version", str(self.future_major + 1) + ".0.0"),
+                        ("--target-os", "linux"),
+                        ("--registry", self.source.origin + "/different-source/"),
+                        ("--include-dev-dependencies",))
+        for index, options in enumerate(incompatible):
+            with self.subTest(options=options):
+                self.transfer = self.root / ("refused-update-" + str(index) + ".tar")
+                self.download(["extra"], "--update", *options, success=False)
+                self.assertEqual(saved_files(), original)
+                self.assertEqual(len(self.source.requests), requests_before)
+                self.assertEqual(first_tar.read_bytes(), first_tar_bytes)
+
+        self.transfer = first_tar
+        self.download(["extra"], "--update", success=False, failure_tarball=first_tar_bytes)
+        self.assertEqual(saved_files(), original)
+        self.assertEqual(len(self.source.requests), requests_before)
+
+    def test_update_migrates_bundle_with_summary_but_no_download_state(self):
+        app = self.source.add("app")
+        app_route = unquote(urlsplit(app["dist"]["tarball"]).path)
+        self.download(["app"])
+        (self.output / "download-state.json").unlink()
+        self.source.add("extra")
+        self.transfer = self.root / "migrated-transfer.tar"
+        self.download(["extra"], "--update")
+        state = self.download_state()
+        self.assertEqual(state["schemaVersion"], 1)
+        self.assertEqual(state["inputMode"], "http-package-list")
+        self.assertEqual(set(state["resumeProfile"]["packageSpecs"]), {"app", "extra"})
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("extra", "1.0.0")})
+        self.assertEqual(self.source_request_count(app_route), 1)
+        self.assert_archive_valid()
+
+    def test_shared_cache_keeps_resolution_state_specific_to_target_node(self):
+        cache = self.root / "shared cache for different node targets"
+        app = self.source.add("app", metadata={"dependencies": {"engine-leaf": "^1.0.0"}})
+        app_route = unquote(urlsplit(app["dist"]["tarball"]).path)
+        self.source.add("engine-leaf", "1.0.0", {"engines": {"node": ">=" + str(self.future_major)}})
+        self.source.add("engine-leaf", "1.1.0", {"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.download(["app"], "--cache-dir", str(cache))
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("engine-leaf", "1.0.0")})
+        self.assertEqual(self.download_state()["resumeProfile"]["nodeVersion"], self.target_node)
+        first_output = self.output
+        first_state = (first_output / "download-state.json").read_bytes()
+        first_tar = self.transfer
+        first_tar_bytes = first_tar.read_bytes()
+
+        self.target_node = str(self.future_major + 1) + ".0.0"
+        self.output = self.root / "bundle for newer target"
+        self.transfer = self.root / "transfer-newer-target.tar"
+        self.download(["app"], "--cache-dir", str(cache))
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("engine-leaf", "1.1.0")})
+        self.assertEqual(self.download_state()["resumeProfile"]["nodeVersion"], self.target_node)
+        self.assertEqual(self.source_request_count(app_route), 1,
+                         "Compatible original package bytes may be reused across target-specific graphs")
+        self.assertEqual((first_output / "download-state.json").read_bytes(), first_state)
+        self.assertEqual(first_tar.read_bytes(), first_tar_bytes)
+        self.assert_archive_valid()
+
+    def test_update_refetches_corrupted_cache_instead_of_trusting_saved_state(self):
+        app = self.source.add("app")
+        app_route = unquote(urlsplit(app["dist"]["tarball"]).path)
+        self.download(["app"])
+        cache = Path(self.download_state()["cacheDir"])
+        cached_app = [file for file in cache.rglob("*.tgz") if file.read_bytes() == self.source.blobs[app_route]]
+        self.assertEqual(len(cached_app), 1)
+        cached_app[0].write_bytes(b"corrupted original package")
+        self.source.add("extra")
+        self.transfer = self.root / "repaired-update.tar"
+        self.download(["extra"], "--update")
+        self.assertEqual(self.source_request_count(app_route), 2)
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("extra", "1.0.0")})
+        self.assert_archive_valid()
+
+    def test_update_preserves_exact_build_metadata_identity_when_registry_order_changes(self):
+        self.source.add("app", "1.0.0+a")
+        self.download(["app"])
+        original_entry = self.entries()[0]
+        original_bytes = (self.output / original_entry["tarball"]).read_bytes()
+        self.source.add("app", "1.0.0+b")
+        versions = self.source.documents["app"]["versions"]
+        self.source.documents["app"]["versions"] = {
+            "1.0.0+b": versions["1.0.0+b"], "1.0.0+a": versions["1.0.0+a"],
+        }
+        self.source.add("extra")
+        self.transfer = self.root / "transfer-build-metadata.tar"
+        self.download(["extra"], "--update")
+        self.assertEqual(self.identities(), {("app", "1.0.0+a"), ("extra", "1.0.0")})
+        current = next(item for item in self.entries() if item["name"] == "app")
+        self.assertEqual(current["sha512"], original_entry["sha512"])
+        self.assertEqual((self.output / current["tarball"]).read_bytes(), original_bytes)
+        self.assert_archive_valid()
+
+    def test_update_preserves_optional_omission_while_new_parent_resolves_compatible_version(self):
+        self.source.add("child", "1.0.0", {"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.source.add("app", metadata={"optionalDependencies": {"child": "latest"}})
+        self.download(["app"])
+        self.assertEqual(self.identities(), {("app", "1.0.0")})
+        original_entry = self.entries()[0]
+        original_bytes = (self.output / original_entry["tarball"]).read_bytes()
+        self.source.add("child", "2.0.0", {"engines": {"node": ">=" + str(self.future_major)}})
+        self.source.add("extra", metadata={"dependencies": {"child": "latest"}})
+        self.transfer = self.root / "transfer-preserved-omission.tar"
+        self.download(["extra"], "--update")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("extra", "1.0.0"), ("child", "2.0.0")})
+        current = next(item for item in self.entries() if item["name"] == "app")
+        self.assertEqual(current["sha512"], original_entry["sha512"])
+        self.assertEqual((self.output / current["tarball"]).read_bytes(), original_bytes,
+                         "A formerly omitted dependency must not rewrite an existing package version")
+        omitted = [edge for edge in self.graph()["edges"]
+                   if edge["from"] == "app@1.0.0" and edge["name"] == "child"]
+        self.assertEqual(len(omitted), 1)
+        self.assertTrue(omitted[0]["omitted"])
+        extra = next(item for item in self.entries() if item["name"] == "extra")
+        metadata = archive_metadata((self.output / extra["tarball"]).read_bytes())
+        self.assertEqual(metadata["dependencies"]["child"], "2.0.0")
+        self.assert_archive_valid()
+
+    def test_update_rejects_changed_source_integrity_of_pinned_version(self):
+        self.source.add("app")
+        self.download(["app"])
+        original_entry = self.entries()[0]
+        original_package = (self.output / original_entry["tarball"]).read_bytes()
+        original_transfer = self.transfer
+        original_transfer_bytes = original_transfer.read_bytes()
+        self.source.add("app", extra_files={"package/index.js": b"module.exports = 'changed version';\n"})
+        self.source.add("extra")
+        self.transfer = self.root / "refused-republished-version.tar"
+        result = self.download(["extra"], "--update", success=False)
+        self.assertIn("integrity", (result.stdout + result.stderr).lower())
+        self.assert_incomplete()
+        self.assertEqual(original_transfer.read_bytes(), original_transfer_bytes,
+                         "A failed update must retain the previously completed transfer")
+        self.assertEqual((self.output / original_entry["tarball"]).read_bytes(), original_package)
 
     def test_missing_optional_dependency_is_not_silently_ignored(self):
         self.source.add("app", metadata={"optionalDependencies": {"missing": "1.0.0"}})
