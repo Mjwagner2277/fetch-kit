@@ -23,6 +23,7 @@ from urllib.parse import unquote, urlsplit
 
 UPLOADER = Path(__file__).resolve().parents[1] / "upload-npm-artifactory-bundle.py"
 REGISTRY_PREFIX = "/artifactory/api/npm/npm-local/"
+INCOMPLETE_MARKER = "npm-bundle.INCOMPLETE"
 
 
 def integrity(data):
@@ -297,6 +298,48 @@ class UploaderTests(unittest.TestCase):
         self.assertEqual(value["length"], len(data))
         self.assertEqual(value["content_type"], "application/octet-stream")
         return data
+
+    def test_incomplete_bundle_is_rejected_before_preparation_or_network(self):
+        self.add_package()
+        (self.bundle / INCOMPLETE_MARKER).write_text("Download is still running.\n")
+        result = self.run_upload(expected=1)
+        self.assertIn(INCOMPLETE_MARKER, result.stdout + result.stderr)
+        self.assertFalse((self.work / "prepared-bundle").exists())
+        self.assertEqual(self.registry.requests, [])
+
+    def test_incomplete_parent_blocks_direct_tarballs_directory_upload(self):
+        self.add_package()
+        (self.bundle / INCOMPLETE_MARKER).write_text("A dependency could not be resolved.\n")
+        result = self.run_upload(packages_dir=self.bundle / "tarballs", expected=1)
+        self.assertIn(INCOMPLETE_MARKER, result.stdout + result.stderr)
+        self.assertEqual(self.registry.requests, [])
+
+    def test_directory_scan_rejects_nested_incomplete_bundle_before_network(self):
+        source = self.add_directory_package("ready.tgz", "ready-lib")
+        live = source.parent / "nested" / "live-bundle"
+        live.mkdir(parents=True)
+        (live / INCOMPLETE_MARKER).write_text("Download is incomplete.\n")
+        result = self.run_upload(packages_dir=source.parent, expected=1)
+        self.assertIn(INCOMPLETE_MARKER, result.stdout + result.stderr)
+        self.assertEqual(self.registry.requests, [])
+
+    def test_incomplete_transfer_archive_is_rejected_before_extraction(self):
+        self.add_package()
+        (self.bundle / INCOMPLETE_MARKER).write_text("Not ready to publish.\n")
+        transfer = self.root / "incomplete-bundle.tar"
+        with tarfile.open(transfer, "w") as archive:
+            archive.add(self.bundle, arcname="npm-transfer-bundle")
+        result = self.run_upload(bundle_tar=transfer, expected=1)
+        self.assertIn(INCOMPLETE_MARKER, result.stdout + result.stderr)
+        self.assertEqual(list((self.work / "extracted").iterdir()), [])
+        self.assertEqual(self.registry.requests, [])
+
+    def test_loose_directory_ignores_unrelated_status_metadata(self):
+        source = self.add_directory_package("ready.tgz")
+        (source.parent / "INCOMPLETE").write_text("Unrelated application state.\n")
+        (source.parent / "summary.json").write_text('{"closureComplete": false}')
+        self.run_upload(packages_dir=source.parent)
+        self.assertEqual(len(self.registry.puts), 1)
 
     def test_directory_discovers_nested_archives_using_real_package_identities(self):
         first = self.add_directory_package("wrong-name-99.0.0.tgz", "@fixture/scoped", "2.3.4")

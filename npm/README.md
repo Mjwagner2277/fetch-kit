@@ -75,7 +75,48 @@ Copy `download-npm-http-bundle.js`, `lib/`, `vendor/`, and
 `upload-npm-artifactory-bundle.py` together when distributing just the current
 tool. No files from `soon-to-be-deprecated/` are needed.
 
-The output directory and transfer tar must be new paths. The completed bundle
+Start with a new output directory and transfer tar path. The downloader creates
+`--output-dir` immediately and saves each verified, sanitized package there
+as it is resolved. Progress is durable throughout the run:
+
+```text
+npm-node24-bundle/
+  tarballs/                       # verified, sanitized packages saved so far
+  partial-packages.json            # running package inventory
+  partial-dependency-graph.json    # selected roots and resolved edges so far
+  summary.json                    # counts, target, status and last error
+  npm-bundle.INCOMPLETE            # present until resolution and preparation finish
+npm-node24-bundle.cache/           # verified original source archives for reuse
+```
+
+An error or interruption keeps these downloads and progress files. To retry,
+rerun the same command with **`--resume`**. The source registry metadata is
+fetched again, and cached tarballs are rechecked against its checksum and package
+identity before reuse. A corrupt cache entry is downloaded again. Resume requires
+the same package requests, registry, target Node/platform, and dependency options;
+credentials can be corrected. Resume rebuilds the graph and sanitized copies;
+old selections are removed from the prepared set only after successful resolution,
+while their original downloads remain cached. Run one downloader per output
+directory at a time.
+
+```powershell
+node .\npm\download-npm-http-bundle.js --node-version 24.0.0 --target-os linux --target-arch x64 --target-libc glibc --packages-file .\packages.txt --output-dir .\npm-node24-bundle --tar-file .\npm-node24-bundle.tar --resume
+```
+
+Use `--cache-dir PATH` to choose another persistent cache location outside the
+output directory. This cache contains original archives and is not the prepared
+publishing bundle. The default cache is `<output-dir>.cache` and is kept after
+success too. Old versions of this script deleted temporary downloads on failure;
+they cannot supply this new resume state, so their failed runs need a fresh run.
+
+The Python uploader refuses inputs containing `npm-bundle.INCOMPLETE`, including
+direct selection of its `tarballs/` subdirectory. Do not remove the marker to
+bypass an unresolved dependency graph. On success, final manifests replace the
+partial inventories and the marker is removed. If only transfer-TAR creation
+fails, the completed directory is preserved with `status: "archive-failed"` and
+can still be published using `--bundle-dir`.
+
+The completed bundle
 contains sanitized tarballs, `packages.json`/`packages.jsonl`, exact root
 selections, `dependency-graph.json`, `summary.json`, and a copy of the standalone
 Python publisher. It does not require an input lockfile and does not fabricate
@@ -129,6 +170,7 @@ give it `--bundle-tar ./npm-node24-bundle.tar` directly.
   bundled `npm-shrinkwrap.json` files are rejected explicitly because their
   locked graph is not supported by this workflow. Archive links and ambiguous
   member paths are rejected before emitting a bundle.
+  Previously downloaded packages and incomplete progress remain available.
 - Root development dependencies can be included with
   `--include-dev-dependencies`; development dependencies of published libraries
   are not needed merely to mirror those libraries.

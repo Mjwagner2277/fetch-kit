@@ -21,7 +21,16 @@ const {
 const RESOLUTION_MODEL = 'Registry dependency closure for offline publishing; not an npm installation tree or peer-placement plan.';
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const log = (message) => process.stderr.write(`${message}\n`);
-const json = (file, value) => fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+const json = (file, value) => {
+  const temporary = `${file}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`);
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.rmSync(temporary, { force: true }); } catch (_) { /* Preserve the original write error. */ }
+  }
+};
+const INCOMPLETE = 'npm-bundle.INCOMPLETE';
 
 class CompatibilityError extends Error {}
 
@@ -49,8 +58,10 @@ The local Node runtime may be older than the target. No npm CLI is required.
   --include-dev-dependencies   Also include direct root devDependencies
   --ca-file FILE               Additional trusted PEM certificates
   --no-ssl                     Explicitly disable TLS certificate verification
-  --output-dir DIR             New prepared bundle directory (no overwrite)
+  --output-dir DIR             Live package directory; retained on error
   --tar-file FILE              New uncompressed transfer TAR (no overwrite)
+  --cache-dir DIR              Verified source cache (default OUTPUT-DIR.cache)
+  --resume                     Resume an incomplete output directory
   --help                      Show this help
 
 Bare roots and @latest select the highest stable version compatible with the
@@ -60,6 +71,9 @@ incompatible edges are reported as omissions; network/auth/integrity failures
 are fatal. Unspecified platform dimensions are unfiltered, never host-derived.
 Scripts/private/publishConfig/devDependencies are removed from package copies.
 No npmrc is read. Source credentials are scoped to the configured registry.
+Downloads and progress are saved as the run proceeds. After an error, rerun
+the same command with --resume to reuse verified downloads. Only complete
+dependency closures produce a publishable bundle and transfer TAR.
 `;
 }
 
@@ -75,13 +89,14 @@ function parseArgs(argv, env = process.env) {
     '--node-version': 'nodeVersion', '--registry': 'registry', '--token': 'token',
     '--username': 'username', '--password': 'password', '--target-os': 'targetOs',
     '--target-arch': 'targetArch', '--target-libc': 'targetLibc', '--ca-file': 'caFile',
-    '--output-dir': 'outputDir', '--tar-file': 'tarFile'
+    '--output-dir': 'outputDir', '--tar-file': 'tarFile', '--cache-dir': 'cacheDir'
   };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--help' || arg === '-h') { options.help = true; continue; }
     if (arg === '--no-ssl') { options.strictSsl = false; continue; }
     if (arg === '--include-dev-dependencies') { options.includeDevDependencies = true; continue; }
+    if (arg === '--resume') { options.resume = true; continue; }
     if (arg === '--') { options.packageSpecs.push(...argv.slice(index + 1)); break; }
     if (own(flags, arg) || arg === '--package' || arg === '--packages-file') {
       const value = argv[++index];
@@ -107,11 +122,30 @@ function parseArgs(argv, env = process.env) {
   if (options.caFile) options.ca = [...tls.rootCertificates, fs.readFileSync(path.resolve(options.caFile))];
   options.packageSpecs.push(...options.packagesFiles.flatMap(readPackagesFile));
   if (!options.packageSpecs.length) throw new Error('Supply at least one --package, --packages-file, or positional package');
+  options.packageSpecs.forEach((spec) => parseRequest(spec));
   const defaultName = `npm-http-bundle-node-v${options.nodeVersion}`;
   options.tarFile = path.resolve(options.tarFile || `${defaultName}.tar`);
   options.outputDir = path.resolve(options.outputDir || options.tarFile.replace(/\.tar$/i, '') + (options.tarFile.endsWith('.tar') ? '' : '-bundle'));
+  options.cacheDir = path.resolve(options.cacheDir || `${options.outputDir}.cache`);
   if (isWithinDirectory(options.outputDir, options.tarFile)) throw new Error('--tar-file must be outside --output-dir');
-  if (fs.existsSync(options.outputDir)) throw new Error(`Output directory already exists: ${options.outputDir}`);
+  if (isWithinDirectory(options.outputDir, options.cacheDir) || isWithinDirectory(options.cacheDir, options.outputDir)) throw new Error('--cache-dir and --output-dir must be separate directories');
+  if (isWithinDirectory(options.cacheDir, options.tarFile)) throw new Error('--tar-file must be outside --cache-dir');
+  options.resumeProfile = {
+    nodeVersion: options.nodeVersion, registry: options.registry,
+    targetOs: options.targetOs, targetArch: options.targetArch, targetLibc: options.targetLibc,
+    includeDevDependencies: options.includeDevDependencies, packageSpecs: options.packageSpecs
+  };
+  if (fs.existsSync(options.outputDir)) {
+    if (!options.resume) throw new Error(`Output directory already exists: ${options.outputDir}. Use --resume for an incomplete run.`);
+    if (fs.lstatSync(options.outputDir).isSymbolicLink() || !fs.statSync(options.outputDir).isDirectory()) throw new Error('--resume requires a real bundle directory');
+    if (!fs.existsSync(path.join(options.outputDir, INCOMPLETE))) throw new Error('Output is already complete or is not a resumable HTTP bundle; use a new --output-dir');
+    let previous;
+    try { previous = JSON.parse(fs.readFileSync(path.join(options.outputDir, 'summary.json'), 'utf8')); }
+    catch (_) { throw new Error('Cannot read the incomplete bundle summary for --resume'); }
+    if (previous.inputMode !== 'http-package-list' || JSON.stringify(previous.resumeProfile) !== JSON.stringify(options.resumeProfile)) throw new Error('--resume requires the same package requests, source registry, target Node/platform, and dependency options');
+  } else if (options.resume) {
+    throw new Error('--resume output directory does not exist; omit --resume for a new run');
+  }
   if (fs.existsSync(options.tarFile)) throw new Error(`Transfer TAR already exists: ${options.tarFile}`);
   return options;
 }
@@ -347,7 +381,15 @@ function normalizeDependencyTags(file, changes) {
       record.paxRecord.data = encodePaxFields(record.pax);
     }
   }
-  if (applied.length) fs.writeFileSync(file, zlib.gzipSync(Buffer.concat([...records.map(encodeTarRecord), Buffer.alloc(1024)]), { level: 9 }));
+  if (applied.length) {
+    const temporary = `${file}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+    try {
+      fs.writeFileSync(temporary, zlib.gzipSync(Buffer.concat([...records.map(encodeTarRecord), Buffer.alloc(1024)]), { level: 9 }));
+      fs.renameSync(temporary, file);
+    } finally {
+      try { fs.rmSync(temporary, { force: true }); } catch (_) { /* Retain the original error. */ }
+    }
+  }
   return applied;
 }
 
@@ -414,21 +456,17 @@ function tarHeader(name, data) {
 }
 
 function createTransferTar(bundleDir, destination) {
+  const entries = JSON.parse(fs.readFileSync(path.join(bundleDir, 'packages.json'), 'utf8'));
+  const included = new Set(['README.txt', 'packages.json', 'packages.jsonl', 'summary.json',
+    'dependency-graph.json', 'root-packages.json', 'upload-npm-artifactory-bundle.py',
+    ...entries.map((entry) => entry.tarball)]);
   const descriptor = fs.openSync(destination, 'wx');
   try {
-    const visit = (directory, relative) => {
-      for (const name of fs.readdirSync(directory).sort()) {
-        const local = path.join(directory, name);
-        const member = `${relative}/${name}`;
-        if (fs.statSync(local).isDirectory()) visit(local, member);
-        else {
-          const record = tarHeader(member, fs.readFileSync(local));
-          let written = 0;
-          while (written < record.length) written += fs.writeSync(descriptor, record, written, record.length - written);
-        }
-      }
-    };
-    visit(bundleDir, 'npm-http-bundle');
+    for (const relative of [...included].sort()) {
+      const record = tarHeader(`npm-http-bundle/${relative}`, fs.readFileSync(path.join(bundleDir, relative)));
+      let written = 0;
+      while (written < record.length) written += fs.writeSync(descriptor, record, written, record.length - written);
+    }
     fs.writeSync(descriptor, Buffer.alloc(1024));
   } finally { fs.closeSync(descriptor); }
 }
@@ -444,9 +482,33 @@ function commitTransferTar(source, destination) {
   }
 }
 
-async function buildBundle(options, stage, rawDir) {
+function safeError(error, options) {
+  let message = String(error.message || error);
+  for (const secret of [options.token, options.password]) {
+    if (secret) message = message.split(secret).join('[redacted]');
+  }
+  return message.replace(/https?:\/\/[^\s"'<>]+/g, (value) => {
+    try { return printableUrl(new URL(value)); } catch (_) { return '[URL redacted]'; }
+  });
+}
+
+function progressSummary(options, state, status, error) {
+  return {
+    schemaVersion: 1, inputMode: 'http-package-list', resolutionModel: RESOLUTION_MODEL,
+    status, closureComplete: false, resumeProfile: options.resumeProfile,
+    nodeVersion: options.nodeVersion, targetNodeVersion: options.nodeVersion,
+    hostNodeVersion: process.version, registry: options.registry,
+    targetPlatform: { os: options.targetOs, arch: options.targetArch, libc: options.targetLibc },
+    outputDir: options.outputDir, cacheDir: options.cacheDir, transferTarFile: options.tarFile,
+    packageCount: state.packageCount || 0, sourceDownloadCount: state.downloads,
+    reusedDownloadCount: state.cacheHits, updatedAt: new Date().toISOString(),
+    ...(error ? { error: safeError(error, options) } : {})
+  };
+}
+
+async function buildBundle(options, stage, state) {
   const packageDir = path.join(stage, 'tarballs');
-  fs.mkdirSync(packageDir);
+  fs.mkdirSync(packageDir, { recursive: true });
   const metadataCache = new Map();
   const archiveCache = new Map();
   const published = new Map();
@@ -457,6 +519,17 @@ async function buildBundle(options, stage, rawDir) {
   const visitedManifests = new Set();
   const tagNormalizations = new Map();
   const queue = options.packageSpecs.map((spec) => ({ ...parseRequest(spec), kind: 'root', optional: false, from: null, path: [spec] }));
+
+  state.checkpoint = (status = 'resolving', error) => {
+    state.packageCount = published.size;
+    json(path.join(stage, 'partial-packages.json'), [...published.values()]);
+    json(path.join(stage, 'partial-dependency-graph.json'), {
+      schemaVersion: 1, resolutionModel: RESOLUTION_MODEL, closureComplete: false,
+      roots, edges, bundledPackages, omissions
+    });
+    json(path.join(stage, 'summary.json'), progressSummary(options, state, status, error));
+  };
+  state.checkpoint();
 
   async function metadataFor(name) {
     if (!metadataCache.has(name)) {
@@ -481,11 +554,33 @@ async function buildBundle(options, stage, rawDir) {
     let registryIntegrity = dist.integrity;
     if (!registryIntegrity && typeof dist.shasum === 'string' && /^[a-fA-F0-9]{40}$/.test(dist.shasum)) registryIntegrity = `sha1-${Buffer.from(dist.shasum, 'hex').toString('base64')}`;
     if (!registryIntegrity) throw new Error(`Registry metadata lacks a supported integrity/shasum for ${key}; refusing an unverified download`);
-    log(`Downloading ${key}`);
-    const raw = path.join(rawDir, safeTarballName(name, version));
-    fs.writeFileSync(raw, await requestBytes(tarballUrl, options));
-    verifyOriginalIntegrity(raw, registryIntegrity, key);
-    const manifests = readArchiveManifests(raw, { key, name, version });
+    const cacheKey = crypto.createHash('sha256').update(JSON.stringify([options.registry, name, version, registryIntegrity])).digest('hex');
+    const raw = path.join(options.cacheDir, `${cacheKey}.tgz`);
+    let manifests;
+    if (fs.existsSync(raw)) {
+      try {
+        if (fs.lstatSync(raw).isSymbolicLink() || !fs.statSync(raw).isFile()) throw new Error('Invalid cache file type');
+        verifyOriginalIntegrity(raw, registryIntegrity, key);
+        manifests = readArchiveManifests(raw, { key, name, version });
+        state.cacheHits += 1;
+        log(`Using verified cached download: ${key}`);
+      } catch (_) {
+        // Preserve rejected bytes for diagnosis without presenting them as a
+        // usable tarball. Fresh metadata and the source digest remain required.
+        fs.renameSync(raw, `${raw}.invalid-${crypto.randomBytes(6).toString('hex')}`);
+        log(`Cached download failed validation; downloading again: ${key}`);
+      }
+    }
+    if (!manifests) {
+      log(`Downloading ${key}`);
+      const incoming = `${raw}.${crypto.randomBytes(8).toString('hex')}.part`;
+      fs.writeFileSync(incoming, await requestBytes(tarballUrl, options));
+      verifyOriginalIntegrity(incoming, registryIntegrity, key);
+      manifests = readArchiveManifests(incoming, { key, name, version });
+      fs.renameSync(incoming, raw);
+      state.downloads += 1;
+      json(path.join(options.cacheDir, `${cacheKey}.json`), { name, version, registry: options.registry, integrity: registryIntegrity, tarball: `${cacheKey}.tgz` });
+    }
     const result = { key, name, version, raw, manifests, manifest: manifests.get('package/package.json'), registryIntegrity, resolved: printableUrl(tarballUrl) };
     archiveCache.set(key, result);
     return result;
@@ -562,8 +657,15 @@ async function buildBundle(options, stage, rawDir) {
       if (!published.has(archive.key)) {
         const tarballName = safeTarballName(archive.name, archive.version);
         const finalTarball = path.join(packageDir, tarballName);
-        const sanitization = sanitizeTarballForAirgapPublish(archive.raw, finalTarball, options);
-        validatePackageTarball(archive, finalTarball);
+        const preparingTarball = `${finalTarball}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+        let sanitization;
+        try {
+          sanitization = sanitizeTarballForAirgapPublish(archive.raw, preparingTarball, options);
+          validatePackageTarball(archive, preparingTarball);
+          fs.renameSync(preparingTarball, finalTarball);
+        } finally {
+          try { fs.rmSync(preparingTarball, { force: true }); } catch (_) { /* Retain the original error. */ }
+        }
         const integrity = `sha512-${crypto.createHash('sha512').update(fs.readFileSync(finalTarball)).digest('base64')}`;
         const manifest = archive.manifest;
         published.set(archive.key, {
@@ -579,6 +681,8 @@ async function buildBundle(options, stage, rawDir) {
         for (const warning of sanitization.offlineWarnings) log(`WARNING: ${archive.key}: ${warning}`);
         registerBundled(archive);
         walkManifest(archive, 'package/package.json', archive.key, false);
+        state.checkpoint();
+        log(`Saved ${archive.key} (${published.size} prepared packages)`);
       }
       if (request.kind === 'root' && options.includeDevDependencies) walkManifest(archive, 'package/package.json', archive.key, true);
     } catch (error) {
@@ -609,12 +713,19 @@ async function buildBundle(options, stage, rawDir) {
       validatePackageTarball({ ...item, key: item.package }, finalTarball);
     }
   }
+  state.checkpoint();
+  const selectedTarballs = new Set(items.map((item) => item.tarball));
+  for (const previous of state.priorTarballs) {
+    if (!selectedTarballs.has(previous)) fs.rmSync(path.join(stage, previous), { force: true });
+  }
   json(path.join(stage, 'packages.json'), items);
   fs.writeFileSync(path.join(stage, 'packages.jsonl'), items.map((item) => JSON.stringify(item)).join('\n') + '\n');
   json(path.join(stage, 'root-packages.json'), roots);
   json(path.join(stage, 'dependency-graph.json'), { schemaVersion: 1, resolutionModel: RESOLUTION_MODEL, closureComplete: true, roots, edges, bundledPackages, omissions });
   const summary = {
     schemaVersion: 1, inputMode: 'http-package-list', resolutionModel: RESOLUTION_MODEL,
+    status: 'complete', resumeProfile: options.resumeProfile, cacheDir: options.cacheDir,
+    sourceDownloadCount: state.downloads, reusedDownloadCount: state.cacheHits,
     closureComplete: true, nodeVersion: options.nodeVersion, targetNodeVersion: options.nodeVersion,
     hostNodeVersion: process.version, registry: options.registry, strictSsl: options.strictSsl,
     targetPlatform: { os: options.targetOs, arch: options.targetArch, libc: options.targetLibc },
@@ -637,34 +748,84 @@ async function main(argv = process.argv.slice(2), env = process.env) {
   const options = parseArgs(argv, env);
   if (options.help) { process.stdout.write(help()); return; }
   if (!options.strictSsl) log('WARNING: TLS certificate verification is explicitly disabled.');
+  const state = { downloads: 0, cacheHits: 0, priorTarballs: new Set() };
+  if (options.resume) {
+    for (const name of ['partial-packages.json', 'packages.json']) {
+      try {
+        const entries = JSON.parse(fs.readFileSync(path.join(options.outputDir, name), 'utf8'));
+        if (Array.isArray(entries)) for (const entry of entries) {
+          if (typeof entry.tarball === 'string' && /^tarballs\/[^/\\]+\.tgz$/.test(entry.tarball)) state.priorTarballs.add(entry.tarball);
+        }
+      } catch (_) { /* Cache validation, not old inventory, determines reuse. */ }
+    }
+    // A previous retry may have failed before restoring its inventory. Inspect
+    // the durable files too, so obsolete selections never enter a complete run.
+    const previousDirectory = path.join(options.outputDir, 'tarballs');
+    if (fs.existsSync(previousDirectory) && !fs.lstatSync(previousDirectory).isSymbolicLink() && fs.statSync(previousDirectory).isDirectory()) {
+      for (const name of fs.readdirSync(previousDirectory)) {
+        if (/^[A-Za-z0-9._+-]+-[a-f0-9]{10}\.tgz$/.test(name)) state.priorTarballs.add(`tarballs/${name}`);
+      }
+    }
+  }
   fs.mkdirSync(path.dirname(options.outputDir), { recursive: true });
-  fs.mkdirSync(path.dirname(options.tarFile), { recursive: true });
-  const work = fs.mkdtempSync(path.join(path.dirname(options.outputDir), '.npm-http-work-'));
-  const stage = path.join(work, 'bundle');
-  const rawDir = path.join(work, 'raw');
-  const temporaryTar = path.join(path.dirname(options.tarFile), `.npm-http-${crypto.randomBytes(10).toString('hex')}.tar`);
-  fs.mkdirSync(stage);
-  fs.mkdirSync(rawDir);
-  let installedOutput = false;
+  if (!options.resume) fs.mkdirSync(options.outputDir);
+  const incompleteFile = path.join(options.outputDir, INCOMPLETE);
+  fs.writeFileSync(incompleteFile, 'Dependency resolution is incomplete. Do not publish this directory. Rerun the same downloader command with --resume.\n');
+  let complete = false;
+  let summary;
+  let temporaryTar;
+  log(`Live package directory: ${options.outputDir}`);
+  log(`Verified source cache: ${options.cacheDir}`);
   try {
-    const summary = await buildBundle(options, stage, rawDir);
-    createTransferTar(stage, temporaryTar);
+    json(path.join(options.outputDir, 'summary.json'), progressSummary(options, state, 'resolving'));
+    // A prior interrupted finalization may have written some complete-manifest
+    // files. The marker remains in place throughout this fresh graph walk.
+    for (const name of ['packages.json', 'packages.jsonl', 'dependency-graph.json', 'root-packages.json']) {
+      fs.rmSync(path.join(options.outputDir, name), { force: true });
+    }
+    const tarballs = path.join(options.outputDir, 'tarballs');
+    if (fs.existsSync(tarballs) && (fs.lstatSync(tarballs).isSymbolicLink() || !fs.statSync(tarballs).isDirectory())) throw new Error('The bundle tarballs path must be a real directory');
+    fs.mkdirSync(options.cacheDir, { recursive: true });
+    if (fs.lstatSync(options.cacheDir).isSymbolicLink()) throw new Error('--cache-dir must be a real directory');
+    summary = await buildBundle(options, options.outputDir, state);
+    for (const name of ['partial-packages.json', 'partial-dependency-graph.json']) fs.rmSync(path.join(options.outputDir, name), { force: true });
+    // Remove this last: until now the publisher must reject even a directory
+    // whose manifests happened to be written before interruption.
+    fs.unlinkSync(incompleteFile);
+    complete = true;
+    fs.mkdirSync(path.dirname(options.tarFile), { recursive: true });
+    temporaryTar = path.join(path.dirname(options.tarFile), `.npm-http-${crypto.randomBytes(10).toString('hex')}.tar`);
+    createTransferTar(options.outputDir, temporaryTar);
     const transferTarSha256 = hashFile(temporaryTar, 'sha256');
     const transferTarBytes = fs.statSync(temporaryTar).size;
-    // Commit the completed archive without replacing another run's output,
-    // including on transfer media without hard-link support.
-    if (fs.existsSync(options.outputDir)) throw new Error(`Output directory already exists: ${options.outputDir}`);
-    fs.renameSync(stage, options.outputDir);
-    installedOutput = true;
-    try { commitTransferTar(temporaryTar, options.tarFile); }
-    catch (error) { fs.rmSync(options.outputDir, { recursive: true, force: true }); installedOutput = false; throw error; }
+    commitTransferTar(temporaryTar, options.tarFile);
     const result = { ...summary, transferTarSha256, transferTarBytes };
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return result;
+  } catch (error) {
+    try {
+      if (complete) {
+        json(path.join(options.outputDir, 'summary.json'), { ...summary, status: 'archive-failed', error: safeError(error, options) });
+      } else if (state.checkpoint) {
+        state.checkpoint('failed', error);
+      } else {
+        json(path.join(options.outputDir, 'summary.json'), progressSummary(options, state, 'failed', error));
+      }
+    } catch (reportError) {
+      log(`Could not update progress report: ${safeError(reportError, options)}. Existing package files and checkpoints were retained.`);
+    }
+    if (complete) {
+      log(`Transfer archive failed; the complete prepared directory is retained and can be published with --bundle-dir: ${options.outputDir}`);
+    } else {
+      log(`Downloaded packages and partial inventory retained: ${options.outputDir}`);
+      log('The dependency graph is INCOMPLETE. Fix the error, then rerun the same command with --resume; verified downloads will be reused.');
+    }
+    throw new Error(safeError(error, options));
   } finally {
-    fs.rmSync(temporaryTar, { force: true });
-    fs.rmSync(work, { recursive: true, force: true });
-    if (!installedOutput) log('No prepared bundle or transfer archive was committed.');
+    if (temporaryTar) {
+      try { fs.rmSync(temporaryTar, { force: true }); }
+      catch (error) { log(`Temporary archive cleanup failed: ${safeError(error, options)}`); }
+    }
   }
 }
 

@@ -60,6 +60,7 @@ class SourceRegistry:
         self.requests = []
         self.redirects = {}
         self.errors = {}
+        self.before_response = None
         self.disabled = False
         fixture = self
 
@@ -71,6 +72,8 @@ class SourceRegistry:
                 route = unquote(urlsplit(self.path).path)
                 fixture.requests.append({"path": route,
                                          "authorization": self.headers.get("Authorization")})
+                if fixture.before_response is not None:
+                    fixture.before_response(route)
                 if route in fixture.redirects:
                     self.send_response(302)
                     self.send_header("Location", fixture.redirects[route])
@@ -205,6 +208,19 @@ Module._load = function (name, ...args) {
     def graph(self):
         return json.loads((self.output / "dependency-graph.json").read_text())
 
+    def assert_incomplete(self, status="failed"):
+        self.assertTrue(self.output.is_dir(), "Downloaded progress must survive a resolution failure")
+        self.assertTrue((self.output / "npm-bundle.INCOMPLETE").is_file())
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertEqual(summary["status"], status)
+        self.assertFalse(summary["closureComplete"])
+        self.assertTrue(summary["error"])
+        self.assertFalse((self.output / "packages.json").exists())
+        self.assertFalse((self.output / "packages.jsonl").exists())
+        partial_graph = json.loads((self.output / "partial-dependency-graph.json").read_text())
+        self.assertFalse(partial_graph["closureComplete"])
+        return json.loads((self.output / "partial-packages.json").read_text())
+
     def assert_archive_valid(self):
         for entry in self.entries():
             data = (self.output / entry["tarball"]).read_bytes()
@@ -317,7 +333,11 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
                 self.download(["app"], success=not concurrent,
                               failure_tarball=existing if concurrent else None)
                 if concurrent:
-                    self.assertFalse(self.output.exists(), "Failed finalization must remove the prepared directory")
+                    summary = json.loads((self.output / "summary.json").read_text())
+                    self.assertEqual(summary["status"], "archive-failed")
+                    self.assertTrue(summary["closureComplete"])
+                    self.assertFalse((self.output / "npm-bundle.INCOMPLETE").exists())
+                    self.assertEqual(self.identities(), {("app", "1.0.0")})
                 else:
                     self.assert_archive_valid()
 
@@ -384,7 +404,7 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
         })
         result = self.download(["app"], success=False)
         self.assertIn("embedded", result.stdout + result.stderr)
-        self.assertFalse(self.output.exists(), "Failed bundle must not leave a partial prepared directory")
+        self.assert_incomplete()
 
     def test_long_valid_package_names_survive_transfer_archive(self):
         name = "@fixture/" + "long-package-name-" * 10
@@ -446,7 +466,7 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
                 self.source.add("app", metadata=metadata, extra_files=files)
                 result = self.download(["app"], success=False)
                 self.assertIn("shrinkwrap", (result.stdout + result.stderr).lower())
-                self.assertFalse(self.output.exists())
+                self.assert_incomplete()
 
     def test_noncanonical_manifests_and_archive_links_are_rejected(self):
         cases = ("package/node_modules/embedded/./package.json",
@@ -465,7 +485,7 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
                     self.source.add("app", extra_files={case: json.dumps(embedded).encode()})
                 result = self.download(["app"], success=False)
                 self.assertRegex((result.stdout + result.stderr).lower(), "canonical|link")
-                self.assertFalse(self.output.exists())
+                self.assert_incomplete()
 
     def test_integrity_failure_does_not_make_transfer_archive(self):
         metadata = self.source.add("app")
@@ -473,10 +493,148 @@ for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
         result = self.download(["app"], success=False)
         self.assertIn("integrity", (result.stdout + result.stderr).lower())
 
+    def test_preflight_error_does_not_create_a_download_directory(self):
+        self.source.add("app")
+        self.download(["app"], "--node-version", "not-a-node-version", success=False)
+        self.assertFalse(self.output.exists())
+        self.assertFalse(self.source.requests, "Invalid configuration must fail before registry access")
+
     def test_required_unresolved_dependency_fails(self):
         self.source.add("app", metadata={"dependencies": {"missing": "1.0.0"}})
         result = self.download(["app"], success=False)
         self.assertIn("missing", result.stdout + result.stderr)
+
+    def test_live_directory_preserves_progress_and_resumes_without_redownloading(self):
+        metadata = self.source.add("app", metadata={"dependencies": {"missing": "1.0.0"},
+            "scripts": {"prepublish": "exit 99", "postinstall": "exit 99"},
+            "private": True, "publishConfig": {"registry": "https://unreachable.invalid"}})
+        app_blob_route = unquote(urlsplit(metadata["dist"]["tarball"]).path)
+        observations = []
+
+        def observe_live_directory(route):
+            if route != "/source/missing":
+                return
+            # The later request has not received its response yet: this proves
+            # the files are visible during resolution, not only in its catch.
+            try:
+                entries = json.loads((self.output / "partial-packages.json").read_text())
+                observations.append({
+                    "entries": entries,
+                    "metadata": [archive_metadata((self.output / item["tarball"]).read_bytes())
+                                 for item in entries],
+                    "summary": json.loads((self.output / "summary.json").read_text()),
+                    "graph": json.loads((self.output / "partial-dependency-graph.json").read_text()),
+                    "incomplete": (self.output / "npm-bundle.INCOMPLETE").is_file(),
+                    "final_manifest": (self.output / "packages.json").exists(),
+                    "transfer": self.transfer.exists(),
+                })
+            except Exception as exc:
+                observations.append({"error": repr(exc)})
+
+        self.source.before_response = observe_live_directory
+        self.download(["app"], success=False)
+        self.assertTrue(observations)
+        for observed in observations:
+            self.assertNotIn("error", observed, observed)
+            self.assertEqual([(item["name"], item["version"]) for item in observed["entries"]],
+                             [("app", "1.0.0")])
+            self.assertEqual(observed["summary"]["status"], "resolving")
+            self.assertFalse(observed["summary"]["closureComplete"])
+            self.assertFalse(observed["graph"]["closureComplete"])
+            self.assertTrue(observed["incomplete"])
+            self.assertFalse(observed["final_manifest"])
+            self.assertFalse(observed["transfer"])
+            for package in observed["metadata"]:
+                for field in ("scripts", "private", "publishConfig"):
+                    self.assertNotIn(field, package)
+        partial = self.assert_incomplete()
+        self.assertEqual([(item["name"], item["version"]) for item in partial], [("app", "1.0.0")])
+
+        # A normal rerun must neither discard progress nor silently resume it.
+        summary_before = (self.output / "summary.json").read_bytes()
+        requests_before = len(self.source.requests)
+        self.download(["app"], success=False)
+        self.assertEqual((self.output / "summary.json").read_bytes(), summary_before)
+        self.assertEqual(len(self.source.requests), requests_before)
+        self.download(["app"], "--resume", "--target-os", "linux", success=False)
+        self.assertEqual((self.output / "summary.json").read_bytes(), summary_before,
+                         "A different resolution profile must not overwrite saved progress")
+        self.assertEqual(len(self.source.requests), requests_before)
+
+        destination = FixtureRegistry()
+        self.addCleanup(destination.close)
+        result = subprocess.run([
+            sys.executable, str(UPLOADER), "--bundle-dir", str(self.output),
+            "--registry-url", destination.url, "--allow-http", "--work-dir", str(self.root / "incomplete-upload"),
+        ], cwd=self.root, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+        self.assertIn("incomplete", (result.stdout + result.stderr).lower())
+        self.assertFalse(destination.requests, "Incomplete progress must be rejected before destination access")
+
+        self.source.before_response = None
+        self.source.add("missing")
+        metadata_count = sum(item["path"] == "/source/app" for item in self.source.requests)
+        self.download(["app"], "--resume")
+        self.assertEqual(sum(item["path"] == app_blob_route for item in self.source.requests), 1,
+                         "A verified cached tarball must not be downloaded again")
+        self.assertGreater(sum(item["path"] == "/source/app" for item in self.source.requests), metadata_count,
+                           "Resume must resolve using fresh registry metadata")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("missing", "1.0.0")})
+        summary = json.loads((self.output / "summary.json").read_text())
+        self.assertEqual(summary["status"], "complete")
+        self.assertTrue(summary["closureComplete"])
+        for filename in ("npm-bundle.INCOMPLETE", "partial-packages.json", "partial-dependency-graph.json"):
+            self.assertFalse((self.output / filename).exists())
+        self.assert_archive_valid()
+
+    def test_resume_revalidates_and_refetches_corrupted_cached_tarballs(self):
+        metadata = self.source.add("app", metadata={"dependencies": {"missing": "1.0.0"}})
+        app_blob_route = unquote(urlsplit(metadata["dist"]["tarball"]).path)
+        self.download(["app"], success=False)
+        self.assert_incomplete()
+        cache = Path(str(self.output) + ".cache")
+        raw_files = [file for file in cache.rglob("*.tgz")
+                     if file.read_bytes() == self.source.blobs[app_blob_route]]
+        self.assertEqual(len(raw_files), 1, "Keep one original verified tarball for resuming this package")
+        raw_files[0].write_bytes(b"tampered cache contents")
+        self.source.add("missing")
+        self.download(["app"], "--resume")
+        self.assertEqual(sum(item["path"] == app_blob_route for item in self.source.requests), 2,
+                         "A corrupt cached tarball must be replaced with a verified source download")
+        self.assert_archive_valid()
+
+    def test_repeated_failed_resume_drops_previously_selected_versions_from_ready_bundle(self):
+        original = self.source.add("app", "1.0.0", {"dependencies": {"missing": "1.0.0"}})
+        original_route = unquote(urlsplit(original["dist"]["tarball"]).path)
+        original_bytes = self.source.blobs[original_route]
+        self.download(["app"], success=False)
+        partial = self.assert_incomplete()
+        self.assertEqual([(item["name"], item["version"]) for item in partial], [("app", "1.0.0")])
+        earlier_tarball = self.output / partial[0]["tarball"]
+        self.assertTrue(earlier_tarball.is_file())
+
+        # This retry cannot even resolve its first root. A subsequent retry
+        # must account for tarballs from earlier runs despite its empty graph.
+        self.source.disabled = True
+        self.download(["app"], "--resume", success=False)
+        self.assert_incomplete()
+        self.source.disabled = False
+        self.source.add("app", "2.0.0")
+        self.download(["app"], "--resume")
+
+        self.assertEqual(self.identities(), {("app", "2.0.0")})
+        selected = {entry["tarball"] for entry in self.entries()}
+        actual = {file.relative_to(self.output).as_posix()
+                  for file in (self.output / "tarballs").rglob("*.tgz")}
+        self.assertEqual(actual, selected, "Ready directory must contain only currently selected tarballs")
+        self.assertFalse(earlier_tarball.exists())
+        with tarfile.open(self.transfer) as transfer:
+            packed = {name.split("/", 1)[1] for name in transfer.getnames() if name.endswith(".tgz")}
+        self.assertEqual(packed, selected, "Transfer archive must not retain a stale package version")
+        cache = Path(str(self.output) + ".cache")
+        self.assertTrue(any(file.read_bytes() == original_bytes for file in cache.rglob("*.tgz")),
+                        "Removing an obsolete prepared package must retain its reusable source cache")
+        self.assert_archive_valid()
 
     def test_missing_optional_dependency_is_not_silently_ignored(self):
         self.source.add("app", metadata={"optionalDependencies": {"missing": "1.0.0"}})

@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 
 
+INCOMPLETE_MARKER = "npm-bundle.INCOMPLETE"
 NUMERIC = r"(?:0|[1-9][0-9]*)"
 PRERELEASE = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
 SEMVER = re.compile(r"(" + NUMERIC + r")\.(" + NUMERIC + r")\.(" + NUMERIC +
@@ -67,6 +68,32 @@ def read_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as exc:
         raise BundleError("Invalid JSON file: " + str(path)) from exc
+
+
+def reject_incomplete_input(directory, work):
+    """Refuse live/failed downloader output, including a selected tarballs child."""
+    directory = directory.resolve()
+    work = work.resolve()
+
+    def check(folder):
+        marker = folder / INCOMPLETE_MARKER
+        if marker.exists() or marker.is_symlink():
+            raise BundleError("Incomplete npm download: " + str(marker) +
+                              "; resume the downloader until it completes before publishing")
+
+    # A caller can select a child of the live output directory directly.
+    for ancestor in (directory, *directory.parents):
+        check(ancestor)
+
+    def walk_error(error):
+        raise BundleError("Cannot inspect source directory: " + str(error.filename))
+
+    for folder, directories, _ in os.walk(directory, followlinks=False, onerror=walk_error):
+        folder = Path(folder)
+        check(folder)
+        # As in loose-package discovery, our own nested output is not input.
+        directories[:] = [name for name in directories
+                          if (folder / name).resolve() != work]
 
 
 def member_path(name):
@@ -129,6 +156,9 @@ def unpack_bundle(source, destination, max_bytes):
     try:
         with tarfile.open(source, "r:*") as archive:
             members = checked_members(archive, max_bytes)
+            if any(relative.name == INCOMPLETE_MARKER for _, relative in members):
+                raise BundleError("Transfer archive contains " + INCOMPLETE_MARKER +
+                                  "; complete the downloader before publishing")
             for member, relative in members:
                 target = destination.joinpath(*relative.parts)
                 if member.isdir():
@@ -670,6 +700,7 @@ def main(argv=None):
         bundle = unpack_bundle(args.bundle_tar, work / "extracted", args.max_unpacked_bytes) if args.bundle_tar else (args.packages_dir or args.bundle_dir).expanduser().resolve()
         if not bundle.is_dir():
             raise BundleError("Bundle directory does not exist")
+        reject_incomplete_input(bundle, work)
         destination = work / "prepared-bundle"
         source_entries = None
         if args.packages_dir:
