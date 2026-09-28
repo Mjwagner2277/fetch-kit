@@ -1,20 +1,29 @@
 # Legacy npm Retrieval Tools
 
-The JavaScript npm downloader now lives here as
-`download-npm-artifactory-bundle.js`. It is retained while being retired. Run it
-from the repository root:
+## JavaScript npm CLI downloader
+
+`download-npm-artifactory-bundle.js` is retained in this directory. From the
+repository root, run:
 
 ```powershell
-node .\npm\soon-to-be-deprecated\download-npm-artifactory-bundle.js --node-version 20.11.1 react
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 20.11.1 lodash
 ```
 
-On Windows it launches npm's JavaScript CLI through Node, avoiding direct
-`spawnSync npm` / `npm.cmd` failures. For a custom installation, add
-`--npm-bin "C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js"`
-with the actual CLI path. Node.js, npm, and `tar` are required. See the
-[main npm README](../README.md#windows-npm-launch-errors) for details.
+This legacy downloader requires Node.js, npm, and tar. On Windows it locates
+npm's `npm-cli.js` and runs it through Node to avoid `spawnSync npm ENOENT`.
+For custom installations, pass `--npm-bin` with the full path to `npm-cli.js`.
+See the [npm workflow guide](../README.md) for the remaining options.
 
-## PowerShell npm Package Retrieval
+## PowerShell npm package retrieval
+
+For the maintained **HTTP-only package-list + target Node version** workflow,
+use [`../download-npm-http-bundle.js`](../download-npm-http-bundle.js) and the
+[current usage guide](../README.md#package-list-and-target-node-version-without-npm).
+It follows the recursive retrieval approach below without invoking npm, adds
+target compatibility checks and archive sanitization, and produces a bundle
+for the standard-library Python publisher. This older PowerShell script remains
+as a reference; it does not provide those target-Node checks or npm's full peer
+placement solver.
 
 `Get-NpmPackage.ps1` downloads npm package tarballs and registry dependency
 metadata without calling `npm`, `node`, `npx`, or any JavaScript toolchain. It

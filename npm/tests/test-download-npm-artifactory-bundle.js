@@ -6,6 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+process.env.COPYFILE_DISABLE = '1';
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const downloader = path.join(repoRoot, 'npm', 'soon-to-be-deprecated', 'download-npm-artifactory-bundle.js');
@@ -40,6 +41,7 @@ const logFile = ${JSON.stringify(fakeNpmLog)};
 fs.appendFileSync(logFile, JSON.stringify({
   args,
   strictSsl: process.env.npm_config_strict_ssl || '',
+  ignoreScripts: process.env.npm_config_ignore_scripts || '',
   cpu: process.env.npm_config_cpu || '',
   os: process.env.npm_config_os || '',
   libc: process.env.npm_config_libc || ''
@@ -80,6 +82,12 @@ function writePackageTar(dest, name, version) {
     version,
     main: 'index.js',
     types: 'index.d.ts',
+    private: true,
+    publishConfig: {
+      registry: 'https://registry.npmjs.org/',
+      tag: 'latest',
+      provenance: true
+    },
     scripts: { prepare: 'npm run build', postinstall: 'node postinstall.js' },
     dependencies: { 'runtime-dep': '^1.0.0' },
     devDependencies: { typescript: '^5.0.0' }
@@ -180,9 +188,13 @@ process.exit(1);
   assert.ok(installLog.args.includes('--cpu=arm64'));
   assert.ok(installLog.args.includes('--libc=musl'));
   assert.strictEqual(installLog.strictSsl, 'false');
+  assert.strictEqual(installLog.ignoreScripts, 'true');
   assert.strictEqual(installLog.os, 'linux');
   assert.strictEqual(installLog.cpu, 'arm64');
   assert.strictEqual(installLog.libc, 'musl');
+  const packLog = npmLog.find((entry) => entry.args[0] === 'pack');
+  assert.ok(packLog.args.includes('--ignore-scripts'));
+  assert.strictEqual(packLog.ignoreScripts, 'true');
 
   const extractDir = path.join(tmp, 'extract');
   fs.mkdirSync(extractDir);
@@ -195,6 +207,13 @@ process.exit(1);
   const packages = JSON.parse(fs.readFileSync(path.join(bundleDir, 'packages.json'), 'utf8'));
   assert.strictEqual(packages[0].package, 'fake-lib@2.0.0');
   assert.strictEqual(packages[0].normalized, true);
+  assert.strictEqual(packages[0].publishSanitized, true);
+  assert.deepStrictEqual(packages[0].publishSanitizedFields, [
+    'scripts',
+    'private',
+    'publishConfig',
+    'devDependencies'
+  ]);
   assert.strictEqual(packages[0].packageJsonValidated, true);
 
   const packageExtractDir = path.join(tmp, 'package-extract');
@@ -206,7 +225,42 @@ process.exit(1);
   assert.strictEqual(packageJson.types, 'index.d.ts');
   assert.ok(packageJson.dependencies['runtime-dep']);
   assert.strictEqual(packageJson.scripts, undefined);
+  assert.strictEqual(packageJson.private, undefined);
+  assert.strictEqual(packageJson.publishConfig, undefined);
   assert.strictEqual(packageJson.devDependencies, undefined);
+
+  const rawStdout = run(process.execPath, [
+    downloader,
+    '--node-version', '20.11.1',
+    '--npm-bin', fakeNpm,
+    '--no-normalize-library-package',
+    '--output-dir', path.join(tmp, 'out-raw'),
+    '--state-dir', path.join(tmp, 'state-raw'),
+    'raw-lib@1.0.0'
+  ]);
+  const rawSummary = JSON.parse(rawStdout);
+  assert.strictEqual(rawSummary.normalized, false);
+  assert.strictEqual(rawSummary.publishSanitized, true);
+  const rawExtractDir = path.join(tmp, 'raw-extract');
+  fs.mkdirSync(rawExtractDir);
+  run('tar', ['-xf', rawSummary.transferTarFile, '-C', rawExtractDir]);
+  const [rawBundleName] = fs.readdirSync(rawExtractDir);
+  const rawBundleDir = path.join(rawExtractDir, rawBundleName);
+  const rawPackages = JSON.parse(fs.readFileSync(path.join(rawBundleDir, 'packages.json'), 'utf8'));
+  assert.strictEqual(rawPackages[0].normalized, false);
+  assert.deepStrictEqual(rawPackages[0].publishSanitizedFields, [
+    'scripts',
+    'private',
+    'publishConfig'
+  ]);
+  const rawPackageExtractDir = path.join(tmp, 'raw-package-extract');
+  fs.mkdirSync(rawPackageExtractDir);
+  run('tar', ['-xzf', path.join(rawBundleDir, rawPackages[0].tarball), '-C', rawPackageExtractDir]);
+  const rawPackageJson = JSON.parse(fs.readFileSync(path.join(rawPackageExtractDir, 'package', 'package.json'), 'utf8'));
+  assert.strictEqual(rawPackageJson.scripts, undefined);
+  assert.strictEqual(rawPackageJson.private, undefined);
+  assert.strictEqual(rawPackageJson.publishConfig, undefined);
+  assert.ok(rawPackageJson.devDependencies.typescript);
 
   const textPackagesFile = path.join(tmp, 'packages-node-18.txt');
   fs.writeFileSync(textPackagesFile, [

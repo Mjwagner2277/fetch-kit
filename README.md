@@ -13,7 +13,8 @@ container CLIs.
   toolchain.
 - `iso/` - ISO-9660/Joliet short-hash file manifests and visible RPM metadata
   without mounting the ISO.
-- `npm/` - npm package and dependency retrieval without invoking npm or Node.js.
+- `npm/` - HTTP-only JavaScript downloader and a Python standard-library Artifactory
+  publisher for transferring npm packages into an airgapped environment.
 - `grype/` - Grype vulnerability database retrieval without invoking Grype.
 - `podman/` - Python OCI image list retrieval, air-gap transfer bundles, and a
   Bash Artifactory Docker repository uploader without invoking Podman, Docker,
@@ -35,12 +36,14 @@ See [rust/README.md](rust/README.md) for examples and limitations.
 ## npm
 
 See [npm/README.md](npm/README.md) for examples and limitations.
-The npm directory also includes `Test-NpmPackageSample.ps1`, which randomly
-tests five packages from a checked-in popular-package sample list.
-The PowerShell npm retriever writes a USB-transferable Artifactory upload bundle
-with a Bash publisher for air-gapped Linux hosts.
-It also includes a Bash GitLab-to-Artifactory npm mirror script for moving
-published package versions between registries.
+Use `download-npm-http-bundle.js` with a package list and a target Node version
+to retrieve the full selected registry dependency graph over HTTP, sanitize
+lifecycle scripts, and create a transfer archive. The target Node version may
+be newer than the connected machine's runtime. No npm CLI is required.
+The Python publisher needs only Python's standard library on the airgapped side
+and accepts either the bundle or a directory of npm tarballs. The earlier npm
+CLI downloader and Bash publisher remain available; the original HTTP-only
+PowerShell implementation is under `npm/soon-to-be-deprecated/`.
 
 ## RPM
 

@@ -84,7 +84,10 @@ cat > "$fake_npm" <<'JS'
 const fs = require('fs');
 const logFile = process.env.FAKE_NPM_LOG;
 const args = process.argv.slice(2);
-fs.appendFileSync(logFile, `${JSON.stringify(args)}\n`);
+fs.appendFileSync(logFile, `${JSON.stringify({
+  args,
+  ignoreScripts: process.env.npm_config_ignore_scripts || ''
+})}\n`);
 
 if (args[0] === 'view') {
   const name = args[1];
@@ -109,6 +112,10 @@ if (args[0] === 'view') {
 }
 
 if (args[0] === 'publish') {
+  if (process.env.npm_config_ignore_scripts !== 'true') {
+    process.stderr.write('npm_config_ignore_scripts was not true\n');
+    process.exit(2);
+  }
   const tarball = args[1] || '';
   if (tarball.includes('same-pkg-1.0.0.tgz')) {
     process.stderr.write('npm ERR! code EPUBLISHCONFLICT\nnpm ERR! already exists\n');
@@ -155,7 +162,7 @@ assert_jq "$dry_summary" '.strictSsl == false'
 assert_jq "$dry_summary" '.results[] | select(.package == "ahead-pkg" and .version == "2.0.0") | .remoteHasNewerStable == true'
 assert_jq "$dry_summary" '.results[] | select(.package == "query-fail-pkg") | .remoteQueryOk == false'
 assert_jq "$dry_summary" '.remoteByPackage["query-fail-pkg"].latestProtected == true'
-jq -e 'select(.[0] == "view" and any(.[]; . == "--strict-ssl=false"))' "$log_file" >/dev/null \
+jq -e 'select(.args[0] == "view" and any(.args[]; . == "--strict-ssl=false"))' "$log_file" >/dev/null \
   || fail "dry run did not pass --strict-ssl=false to npm view"
 
 : > "$log_file"
@@ -168,15 +175,19 @@ publish_summary="$(
     --no-ssl \
     --npm-bin "$fake_npm" \
     --work-dir "${tmp}/work-publish" \
+    --npm-flags "--ignore-scripts=false --loglevel=error" \
     --skip-existing
 )"
 
 assert_jq "$publish_summary" '.strictSsl == false'
+assert_jq "$publish_summary" '.ignoreScripts == true'
 assert_jq "$publish_summary" '.skippedExisting == 1'
 assert_jq "$publish_summary" '.results[0].status == "skipped-existing"'
 assert_jq "$publish_summary" '.results[0].distTag == "latest"'
-jq -e 'select(.[0] == "publish" and any(.[]; . == "--strict-ssl=false"))' "$log_file" >/dev/null \
+jq -e 'select(.args[0] == "publish" and any(.args[]; . == "--strict-ssl=false"))' "$log_file" >/dev/null \
   || fail "publish did not pass --strict-ssl=false to npm publish"
+jq -e 'select(.args[0] == "publish" and .ignoreScripts == "true" and .args[-1] == "--ignore-scripts=true" and any(.args[]; . == "--ignore-scripts=false"))' "$log_file" >/dev/null \
+  || fail "publish did not force --ignore-scripts=true after custom npm flags"
 
 : > "$log_file"
 never_summary="$(
@@ -192,7 +203,7 @@ never_summary="$(
 
 assert_jq "$never_summary" 'all(.results[]; .distTag | startswith("airgap-"))'
 if [[ -s "$log_file" ]]; then
-  ! jq -e 'select(.[0] == "view")' "$log_file" >/dev/null || fail "--latest-policy never queried remote versions"
+  ! jq -e 'select(.args[0] == "view")' "$log_file" >/dev/null || fail "--latest-policy never queried remote versions"
 fi
 
 printf 'upload npm bundle: ok\n'

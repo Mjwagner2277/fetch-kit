@@ -90,7 +90,7 @@ for (const npmBin of ['npm', 'npm.cmd']) {
   assert.strictEqual(call.options.cwd, runOptions.cwd);
   assert.strictEqual(call.options.env.CUSTOM_NPM_TEST, 'inherited');
   assert.strictEqual(call.options.env.npm_config_cpu, 'arm64');
-  assert.strictEqual(call.options.env.npm_config_engine_strict, 'false');
+  assert.strictEqual(call.options.env.npm_config_ignore_scripts, 'true');
   assert.ok(!call.options.shell, 'npm arguments must not be interpreted by a shell');
   assert.deepStrictEqual(args, ['view', 'example@>=1 <3', '--registry=https://example.invalid/?a=1&b=2']);
 }

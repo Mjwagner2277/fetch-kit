@@ -1,0 +1,587 @@
+#!/usr/bin/env python3
+"""HTTP-only bundle integration tests; Python stdlib + Node, no npm or system tar.
+
+Run: python3 -m unittest discover -s npm/tests -p 'test_npm_http_bundle.py' -v
+All registries are local fixtures. The downloader runs with an empty PATH and a
+preload that rejects child_process imports, including indirect CLI dependencies.
+"""
+
+import base64
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlsplit
+
+from test_upload_npm_artifactory_bundle import FixtureRegistry, archive_metadata
+
+
+NPM_DIR = Path(__file__).resolve().parents[1]
+DOWNLOADER = NPM_DIR / "download-npm-http-bundle.js"
+UPLOADER = NPM_DIR / "upload-npm-artifactory-bundle.py"
+NODE = shutil.which("node")
+
+
+def integrity(data):
+    return "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
+
+
+def package_archive(metadata, extra_files=None, extra_members=()):
+    files = {
+        "package/package.json": json.dumps(metadata).encode(),
+        "package/index.js": b"module.exports = 42;\n",
+    }
+    files.update(extra_files or {})
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+        for name, content in files.items():
+            record = tarfile.TarInfo(name)
+            record.size = len(content)
+            record.mode = 0o644
+            archive.addfile(record, io.BytesIO(content))
+        for record, content in extra_members:
+            archive.addfile(record, io.BytesIO(content) if content is not None else None)
+    return stream.getvalue()
+
+
+class SourceRegistry:
+    def __init__(self):
+        self.documents = {}
+        self.blobs = {}
+        self.requests = []
+        self.redirects = {}
+        self.errors = {}
+        self.disabled = False
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                route = unquote(urlsplit(self.path).path)
+                fixture.requests.append({"path": route,
+                                         "authorization": self.headers.get("Authorization")})
+                if route in fixture.redirects:
+                    self.send_response(302)
+                    self.send_header("Location", fixture.redirects[route])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if fixture.disabled:
+                    status, body = 503, {"error": "source_is_offline"}
+                elif route in fixture.errors:
+                    status, body = fixture.errors[route], {"error": "fixture_error"}
+                elif route in fixture.blobs:
+                    status, body = 200, fixture.blobs[route]
+                elif route.startswith("/source/") and route[len("/source/"):] in fixture.documents:
+                    status, body = 200, fixture.documents[route[len("/source/"):]]
+                else:
+                    status, body = 404, {"error": "not_found"}
+                if not isinstance(body, bytes):
+                    body = json.dumps(body).encode()
+                    content_type = "application/json"
+                else:
+                    content_type = "application/octet-stream"
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.origin = "http://127.0.0.1:" + str(self.server.server_port)
+        self.url = self.origin + "/source/"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": 0.01}, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def add(self, name, version="1.0.0", metadata=None, extra_files=None, archive_metadata_override=None,
+            extra_members=()):
+        manifest = {"name": name, "version": version, "main": "index.js"}
+        manifest.update(metadata or {})
+        blob = package_archive(archive_metadata_override or manifest, extra_files, extra_members)
+        route = "/source/" + name + "/-/" + name.split("/")[-1] + "-" + version + ".tgz"
+        self.blobs[route] = blob
+        manifest["dist"] = {"tarball": self.origin + route, "integrity": integrity(blob),
+                            "shasum": hashlib.sha1(blob).hexdigest()}
+        document = self.documents.setdefault(name, {"name": name, "versions": {}, "dist-tags": {}})
+        document["versions"][version] = manifest
+        document["dist-tags"]["latest"] = version
+        return manifest
+
+
+@unittest.skipUnless(NODE, "Requires Node, but not npm")
+class HTTPBundleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.local_node = subprocess.check_output([NODE, "--version"], text=True).strip()
+        cls.future_major = int(cls.local_node.lstrip("v").split(".")[0]) + 2
+        cls.target_node = str(cls.future_major) + ".0.0"
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="npm http bundle ")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.output = self.root / "bundle"
+        self.transfer = self.root / "transfer.tar"
+        self.downloader = DOWNLOADER
+        self.process_guard = self.root / "deny child processes.cjs"
+        self.process_guard.write_text("""'use strict';
+const Module = require('module');
+const originalLoad = Module._load;
+Module._load = function (name, ...args) {
+  if (name === 'child_process' || name === 'node:child_process') {
+    throw new Error('HTTP-only workflow must not load ' + name);
+  }
+  return originalLoad.call(this, name, ...args);
+};
+""")
+        self.source = SourceRegistry()
+        self.addCleanup(self.source.close)
+        self.env = os.environ.copy()
+        for key in list(self.env):
+            if key.lower().startswith("npm_config_") or key.lower() in (
+                    "npm_token", "npm_username", "npm_password", "npm_bin",
+                    "node_options", "node_path", "http_proxy", "https_proxy", "all_proxy",
+                    "artifactory_token", "path"):
+                self.env.pop(key)
+        # Windows commonly stores this as Path. Remove every casing before
+        # adding the empty value so neither npm.cmd nor tar can be found.
+        self.env["PATH"] = ""
+        self.marker = self.root / "hook-ran"
+
+    def download(self, packages, *extra, success=True, token=None, windows_list=False,
+                 packages_file=None, failure_tarball=None):
+        requested = packages_file or self.root / "packages.txt"
+        if packages_file:
+            pass
+        elif windows_list:
+            requested.write_bytes(("\ufeff" + "\r\n".join(packages) + "\r\n").encode("utf-8"))
+        else:
+            requested.write_text("\n".join(packages) + "\n")
+        env = self.env.copy()
+        if token:
+            env["NPM_TOKEN"] = token
+        result = subprocess.run([
+            NODE, "--require", str(self.process_guard), str(self.downloader), "--node-version", self.target_node,
+            "--packages-file", str(requested), "--registry", self.source.url,
+            "--output-dir", str(self.output), "--tar-file", str(self.transfer), *extra,
+        ], cwd=self.root, env=env, capture_output=True, text=True, timeout=60)
+        diagnostic = result.stdout + "\n" + result.stderr
+        if success:
+            self.assertEqual(result.returncode, 0, diagnostic)
+            self.assertTrue(self.transfer.is_file(), diagnostic)
+        else:
+            self.assertNotEqual(result.returncode, 0, diagnostic)
+            if failure_tarball is None:
+                self.assertFalse(self.transfer.exists(), "Failure must not leave a successful transfer archive")
+            else:
+                self.assertEqual(self.transfer.read_bytes(), failure_tarball,
+                                 "A concurrent transfer archive must never be overwritten")
+        self.assertFalse(self.marker.exists(), "No package lifecycle hook may execute")
+        return result
+
+    def entries(self):
+        return json.loads((self.output / "packages.json").read_text())
+
+    def identities(self):
+        return {(item["name"], item["version"]) for item in self.entries()}
+
+    def graph(self):
+        return json.loads((self.output / "dependency-graph.json").read_text())
+
+    def assert_archive_valid(self):
+        for entry in self.entries():
+            data = (self.output / entry["tarball"]).read_bytes()
+            self.assertEqual(entry["sha512"], hashlib.sha512(data).hexdigest())
+            self.assertEqual(entry["sha1"], hashlib.sha1(data).hexdigest())
+            self.assertEqual(entry["bytes"], len(data))
+            package = archive_metadata(data)
+            self.assertEqual((package["name"], package["version"]), (entry["name"], entry["version"]))
+            self.assertNotIn("scripts", package)
+            self.assertNotIn("publishConfig", package)
+            self.assertNotIn("private", package)
+        with tarfile.open(self.transfer) as transfer:
+            names = transfer.getnames()
+            self.assertTrue(any(name.endswith("/packages.json") or name == "packages.json" for name in names))
+            for entry in self.entries():
+                member = next(name for name in names if name.endswith("/" + entry["tarball"]) or name == entry["tarball"])
+                self.assertEqual(transfer.extractfile(member).read(), (self.output / entry["tarball"]).read_bytes())
+
+    def test_future_target_deep_graph_cycles_aliases_and_multiple_versions(self):
+        future = str(self.future_major)
+        self.source.add("app", metadata={
+            "engines": {"node": ">=" + future},
+            "dependencies": {"level-one": "^1.0.0", "alias-name": "npm:@fixture/leaf@^1.0.0"},
+            "scripts": {"prepublish": "exit 99", "prepublishOnly": "exit 99", "publish": "exit 99",
+                        "install": 'node -e "require(\'fs\').writeFileSync(' + json.dumps(str(self.marker)) + ',\'yes\')"'},
+            "private": True, "publishConfig": {"registry": "https://unreachable.invalid"},
+        })
+        self.source.add("app", "2.0.0", {"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.source.add("level-one", metadata={"dependencies": {"level-two": "1.0.0"}})
+        self.source.add("level-two", metadata={"dependencies": {"level-three": "1.0.0"}})
+        self.source.add("level-three", metadata={"dependencies": {"level-one": "1.0.0"}})
+        self.source.add("@fixture/leaf")
+        self.source.add("versions", "1.0.0")
+        self.source.add("versions", "2.0.0")
+        self.download(["# roots, including two versions of one package", "app", "versions@2.0.0", "versions@1.0.0"])
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("level-one", "1.0.0"),
+            ("level-two", "1.0.0"), ("level-three", "1.0.0"), ("@fixture/leaf", "1.0.0"),
+            ("versions", "1.0.0"), ("versions", "2.0.0")})
+        graph = self.graph()
+        self.assertTrue(graph["closureComplete"])
+        self.assertEqual(len(graph["roots"]), 3)
+        self.assertTrue(any(edge.get("installName") == "alias-name" for edge in graph["edges"]))
+        self.assertEqual(sum(request["path"] == "/source/level-one" for request in self.source.requests), 1)
+        self.assert_archive_valid()
+
+    def test_every_transitive_version_is_filtered_by_target_node(self):
+        self.source.add("app", metadata={"dependencies": {"engine-leaf": ">=1 <3"}})
+        self.source.add("engine-leaf", "1.0.0", {"engines": {"node": ">=" + str(self.future_major)}})
+        self.source.add("engine-leaf", "2.0.0", {"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.download(["app@1.0.0"])
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("engine-leaf", "1.0.0")})
+
+    def test_package_list_preserves_spaces_in_inline_and_separate_ranges(self):
+        for name in ("app", "@fixture/space"):
+            for version in ("1.0.0", "2.0.0", "3.0.0"):
+                self.source.add(name, version)
+        self.download(["app@>=1 <3", "@fixture/space >=1 <3"])
+        self.assertEqual(self.identities(), {("app", "2.0.0"), ("@fixture/space", "2.0.0")})
+
+    def test_windows_bom_encodings_accept_text_and_uppercase_json_lists(self):
+        self.source.add("app")
+        for encoding, bom in (("utf-8", b"\xef\xbb\xbf"),
+                              ("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff")):
+            for extension, contents in (("txt", "# Windows package list\r\napp@1.0.0\r\n"),
+                                       ("JSON", '{\r\n  "dependencies": {"app": "1.0.0"}\r\n}\r\n')):
+                with self.subTest(encoding=encoding, extension=extension):
+                    slug = encoding + "-" + extension
+                    self.output = self.root / ("bundle-" + slug)
+                    self.transfer = self.root / ("transfer-" + slug + ".tar")
+                    requested = self.root / ("packages-" + slug + "." + extension)
+                    requested.write_bytes(bom + contents.encode(encoding))
+                    self.download([], packages_file=requested)
+                    self.assertEqual(self.identities(), {("app", "1.0.0")})
+
+    def test_windows_transfer_path_cannot_alias_the_bundle_directory(self):
+        cases = [
+            [r"C:\Transfer\Bundle", r"c:\transfer\BUNDLE\transfer.tar", True],
+            [r"C:\Transfer\Bundle", r"c:\transfer\BUNDLE", True],
+            [r"C:\Transfer\Bundle", r"C:\Transfer\Bundle-other\transfer.tar", False],
+            [r"C:\Transfer\Bundle", r"C:\Transfer\transfer.tar", False],
+            [r"C:\Transfer\Bundle", r"D:\Transfer\Bundle\transfer.tar", False],
+        ]
+        script = """
+const assert = require('assert');
+const {win32} = require('path');
+const {isWithinDirectory} = require(process.argv[1]);
+for (const [directory, candidate, expected] of JSON.parse(process.argv[2])) {
+  assert.strictEqual(isWithinDirectory(directory, candidate, win32), expected, candidate);
+}
+"""
+        result = subprocess.run([NODE, "--require", str(self.process_guard), "-e", script,
+                                 str(self.downloader), json.dumps(cases)], cwd=self.root,
+                                env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+
+    def test_transfer_on_filesystem_without_hardlinks_preserves_concurrent_archive(self):
+        self.source.add("app")
+        guard = self.process_guard.read_text()
+        existing = b"another completed transfer"
+        for concurrent in (False, True):
+            with self.subTest(concurrent=concurrent):
+                self.output = self.root / ("bundle-hardlinks-" + str(concurrent))
+                self.transfer = self.root / ("transfer-hardlinks-" + str(concurrent) + ".tar")
+                self.process_guard.write_text(guard + "\nconst fs = require('fs');\n"
+                    "fs.linkSync = function (source, destination) {\n" +
+                    ("  fs.writeFileSync(destination, 'another completed transfer', {flag: 'wx'});\n"
+                     if concurrent else "") +
+                    "  throw Object.assign(new Error('fixture: hardlinks unavailable'), {code: 'ENOTSUP'});\n"
+                    "};\n")
+                self.download(["app"], success=not concurrent,
+                              failure_tarball=existing if concurrent else None)
+                if concurrent:
+                    self.assertFalse(self.output.exists(), "Failed finalization must remove the prepared directory")
+                else:
+                    self.assert_archive_valid()
+
+    def test_peers_optional_peers_and_optional_override_are_included(self):
+        self.source.add("app", metadata={
+            "dependencies": {"overridden": "1.0.0"},
+            "optionalDependencies": {"overridden": "2.0.0", "optional-leaf": "1.0.0"},
+            "peerDependencies": {"peer-leaf": "^1.0.0", "optional-peer": "^1.0.0"},
+            "peerDependenciesMeta": {"optional-peer": {"optional": True}},
+            "devDependencies": {"never-request-dev": "1.0.0"},
+        })
+        for name in ("optional-leaf", "peer-leaf", "optional-peer"):
+            self.source.add(name)
+        self.source.add("overridden", "1.0.0")
+        self.source.add("overridden", "2.0.0")
+        self.download(["app"])
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("overridden", "2.0.0"),
+            ("optional-leaf", "1.0.0"), ("peer-leaf", "1.0.0"), ("optional-peer", "1.0.0")})
+        self.assertFalse(any("never-request-dev" in request["path"] for request in self.source.requests))
+
+    def test_target_platform_omits_only_incompatible_optional_packages(self):
+        self.source.add("app", metadata={"optionalDependencies": {"windows-only": "1.0.0",
+                            "glibc-only": "1.0.0", "linux-arm": "1.0.0"}})
+        self.source.add("windows-only", metadata={"os": ["win32"]})
+        self.source.add("glibc-only", metadata={"os": ["linux"], "libc": ["glibc"]})
+        self.source.add("linux-arm", metadata={"os": ["linux"], "cpu": ["arm64"], "libc": ["musl"]})
+        self.download(["app"], "--target-os", "linux", "--target-arch", "arm64", "--target-libc", "musl")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("linux-arm", "1.0.0")})
+        self.assertEqual(len(self.graph()["omissions"]), 2)
+        self.assertFalse(any("windows-only/-/" in request["path"] for request in self.source.requests))
+
+    def test_bundled_manifests_are_sanitized_and_external_dependencies_resolved(self):
+        embedded = {"name": "embedded", "version": "1.0.0",
+                    "scripts": {"prepublish": "exit 97", "postinstall": "exit 98"},
+                    "dependencies": {"external-leaf": "^1.0.0"}, "private": True,
+                    "publishConfig": {"registry": "https://unreachable.invalid"}}
+        nested = {"name": "nested", "version": "1.0.0", "scripts": {"prepare": "exit 99"},
+                  "dependencies": {"deep-external": "1.0.0"}}
+        embedded["dependencies"]["nested"] = "1.0.0"
+        self.source.add("app", metadata={"dependencies": {"embedded": "1.0.0"},
+                            "bundledDependencies": ["embedded"]}, extra_files={
+            "package/node_modules/embedded/package.json": json.dumps(embedded).encode(),
+            "package/node_modules/embedded/node_modules/nested/package.json": json.dumps(nested).encode(),
+        })
+        self.source.add("external-leaf")
+        self.source.add("deep-external")
+        self.download(["app"])
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("external-leaf", "1.0.0"), ("deep-external", "1.0.0")})
+        app = next(entry for entry in self.entries() if entry["name"] == "app")
+        with tarfile.open(self.output / app["tarball"]) as archive:
+            for name in archive.getnames():
+                if name.endswith("package.json"):
+                    self.assertNotIn("scripts", json.load(archive.extractfile(name)))
+        self.assertFalse(any(request["path"] in ("/source/embedded", "/source/nested")
+                             for request in self.source.requests))
+
+    def test_incompatible_bundled_version_cannot_leave_partial_optional_package(self):
+        self.source.add("app", metadata={"optionalDependencies": {"optional-container": "1.0.0"}})
+        embedded = {"name": "embedded", "version": "1.0.0",
+                    "engines": {"node": ">=" + str(self.future_major + 1)}}
+        self.source.add("optional-container", metadata={"dependencies": {"embedded": "1.0.0"},
+                    "bundledDependencies": ["embedded"]}, extra_files={
+            "package/node_modules/embedded/package.json": json.dumps(embedded).encode(),
+        })
+        result = self.download(["app"], success=False)
+        self.assertIn("embedded", result.stdout + result.stderr)
+        self.assertFalse(self.output.exists(), "Failed bundle must not leave a partial prepared directory")
+
+    def test_long_valid_package_names_survive_transfer_archive(self):
+        name = "@fixture/" + "long-package-name-" * 10
+        self.assertLess(len(name), 214)
+        self.source.add(name)
+        self.download([name])
+        self.assertEqual(self.identities(), {(name, "1.0.0")})
+        self.assert_archive_valid()
+
+    def test_dependency_tags_are_pinned_for_offline_use_including_aliases_and_bundles(self):
+        embedded = {"name": "embedded", "version": "1.0.0",
+                    "dependencies": {"embedded-channel": "preview"}}
+        self.source.add("app", metadata={
+            "dependencies": {"release-channel": "preview", "latest-leaf": "latest", "intended-latest": "latest",
+                             "release-alias": "npm:@fixture/aliased@canary", "embedded": "1.0.0"},
+            "peerDependencies": {"peer-channel": "next"},
+            "optionalDependencies": {"optional-channel": "next"},
+            "bundledDependencies": ["embedded"],
+        }, extra_files={"package/node_modules/embedded/package.json": json.dumps(embedded).encode()})
+        for name, tag in (("release-channel", "preview"), ("embedded-channel", "preview"),
+                          ("peer-channel", "next"), ("optional-channel", "next")):
+            self.source.add(name, "1.0.0")
+            self.source.add(name, "2.0.0")
+            self.source.documents[name]["dist-tags"][tag] = "1.0.0"
+        self.source.add("latest-leaf", "1.0.0")
+        self.source.add("latest-leaf", "2.0.0", {"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.source.add("intended-latest", "1.0.0")
+        self.source.add("intended-latest", "2.0.0")
+        self.source.documents["intended-latest"]["dist-tags"]["latest"] = "1.0.0"
+        self.source.add("@fixture/aliased", "1.0.0-beta.1")
+        self.source.documents["@fixture/aliased"]["dist-tags"]["canary"] = "1.0.0-beta.1"
+        self.download(["app"])
+        self.assertIn(("latest-leaf", "1.0.0"), self.identities())
+        self.assertNotIn(("latest-leaf", "2.0.0"), self.identities())
+        app = next(item for item in self.entries() if item["name"] == "app")
+        with tarfile.open(self.output / app["tarball"]) as archive:
+            metadata = json.load(archive.extractfile("package/package.json"))
+            bundled = json.load(archive.extractfile("package/node_modules/embedded/package.json"))
+        self.assertEqual(metadata["dependencies"]["release-channel"], "1.0.0")
+        self.assertEqual(metadata["dependencies"]["latest-leaf"], "1.0.0")
+        self.assertEqual(metadata["dependencies"]["intended-latest"], "1.0.0")
+        self.assertEqual(metadata["dependencies"]["release-alias"], "npm:@fixture/aliased@1.0.0-beta.1")
+        self.assertEqual(metadata["peerDependencies"]["peer-channel"], "1.0.0")
+        self.assertEqual(metadata["optionalDependencies"]["optional-channel"], "1.0.0")
+        self.assertEqual(bundled["dependencies"]["embedded-channel"], "1.0.0")
+        self.assert_archive_valid()
+
+    def test_published_shrinkwraps_fail_explicitly_in_root_and_bundled_packages(self):
+        for index, prefix in enumerate(("package/", "package/node_modules/embedded/")):
+            with self.subTest(prefix=prefix):
+                self.output = self.root / ("bundle-shrinkwrap-" + str(index))
+                self.transfer = self.root / ("transfer-shrinkwrap-" + str(index) + ".tar")
+                files = {prefix + "npm-shrinkwrap.json": json.dumps({"lockfileVersion": 2,
+                    "name": "app" if index == 0 else "embedded", "version": "1.0.0", "packages": {}}).encode()}
+                metadata = {}
+                if index:
+                    files[prefix + "package.json"] = json.dumps({"name": "embedded", "version": "1.0.0"}).encode()
+                    metadata = {"dependencies": {"embedded": "1.0.0"}, "bundledDependencies": ["embedded"]}
+                self.source.add("app", metadata=metadata, extra_files=files)
+                result = self.download(["app"], success=False)
+                self.assertIn("shrinkwrap", (result.stdout + result.stderr).lower())
+                self.assertFalse(self.output.exists())
+
+    def test_noncanonical_manifests_and_archive_links_are_rejected(self):
+        cases = ("package/node_modules/embedded/./package.json",
+                 "package//node_modules/embedded/package.json", "symlink", "hardlink")
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                self.output = self.root / ("bundle-path-" + str(index))
+                self.transfer = self.root / ("transfer-path-" + str(index) + ".tar")
+                if case in ("symlink", "hardlink"):
+                    record = tarfile.TarInfo("package/link")
+                    record.type = tarfile.SYMTYPE if case == "symlink" else tarfile.LNKTYPE
+                    record.linkname = "package/index.js"
+                    self.source.add("app", extra_members=[(record, None)])
+                else:
+                    embedded = {"name": "embedded", "version": "1.0.0", "scripts": {"postinstall": "exit 99"}}
+                    self.source.add("app", extra_files={case: json.dumps(embedded).encode()})
+                result = self.download(["app"], success=False)
+                self.assertRegex((result.stdout + result.stderr).lower(), "canonical|link")
+                self.assertFalse(self.output.exists())
+
+    def test_integrity_failure_does_not_make_transfer_archive(self):
+        metadata = self.source.add("app")
+        metadata["dist"]["integrity"] = integrity(b"different bytes")
+        result = self.download(["app"], success=False)
+        self.assertIn("integrity", (result.stdout + result.stderr).lower())
+
+    def test_required_unresolved_dependency_fails(self):
+        self.source.add("app", metadata={"dependencies": {"missing": "1.0.0"}})
+        result = self.download(["app"], success=False)
+        self.assertIn("missing", result.stdout + result.stderr)
+
+    def test_missing_optional_dependency_is_not_silently_ignored(self):
+        self.source.add("app", metadata={"optionalDependencies": {"missing": "1.0.0"}})
+        self.download(["app"], success=False)
+
+    def test_unsupported_dependency_protocols_fail_closed(self):
+        for index, spec in enumerate(("git+https://example.invalid/repo.git", "file:../local", "workspace:*")):
+            with self.subTest(spec=spec):
+                self.output = self.root / ("bundle-" + str(index))
+                self.transfer = self.root / ("transfer-" + str(index) + ".tar")
+                self.source.add("app", metadata={"dependencies": {"unsupported": spec}})
+                result = self.download(["app"], success=False)
+                self.assertIn("unsupported", (result.stdout + result.stderr).lower())
+
+    def test_diamond_graph_preserves_different_transitive_versions(self):
+        self.source.add("app", metadata={"dependencies": {"left": "1.0.0", "right": "1.0.0"}})
+        self.source.add("left", metadata={"dependencies": {"shared": "^1.0.0"}})
+        self.source.add("right", metadata={"dependencies": {"shared": "~2.0.0"}})
+        self.source.add("shared", "1.8.0")
+        self.source.add("shared", "2.0.9")
+        self.source.add("shared", "2.1.0")
+        self.download(["app"])
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("left", "1.0.0"), ("right", "1.0.0"),
+                                            ("shared", "1.8.0"), ("shared", "2.0.9")})
+
+    def test_dev_dependencies_opt_in_is_root_only(self):
+        self.source.add("app", metadata={"dependencies": {"runtime-leaf": "1.0.0"},
+                                         "devDependencies": {"root-dev": "1.0.0"}})
+        self.source.add("runtime-leaf", metadata={"devDependencies": {"transitive-dev": "1.0.0"}})
+        self.source.add("root-dev")
+        self.download(["app"], "--include-dev-dependencies")
+        self.assertEqual(self.identities(), {("app", "1.0.0"), ("runtime-leaf", "1.0.0"), ("root-dev", "1.0.0")})
+        self.assertFalse(any("transitive-dev" in request["path"] for request in self.source.requests))
+
+    def test_required_engine_incompatibility_fails(self):
+        self.source.add("app", metadata={"dependencies": {"too-new": "1.0.0"}})
+        self.source.add("too-new", metadata={"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.download(["app"], success=False)
+
+    def test_explicit_tag_does_not_fall_back_to_another_version(self):
+        self.source.add("app", "1.0.0")
+        self.source.add("app", "2.0.0", {"engines": {"node": ">=" + str(self.future_major + 1)}})
+        self.source.documents["app"]["dist-tags"]["preview"] = "2.0.0"
+        self.download(["app@preview"], success=False)
+
+    def test_tarball_identity_must_match_resolved_package(self):
+        self.source.add("app", archive_metadata_override={"name": "wrong-name", "version": "1.0.0"})
+        self.download(["app"], success=False)
+
+    def test_optional_authentication_failure_is_fatal(self):
+        self.source.add("app", metadata={"optionalDependencies": {"private-package": "1.0.0"}})
+        self.source.errors["/source/private-package"] = 401
+        self.download(["app"], success=False)
+
+    def test_cross_origin_tarball_redirect_does_not_leak_registry_token(self):
+        external = SourceRegistry()
+        self.addCleanup(external.close)
+        metadata = self.source.add("app")
+        route = unquote(urlsplit(metadata["dist"]["tarball"]).path)
+        external.blobs["/cdn/app.tgz"] = self.source.blobs[route]
+        self.source.redirects[route] = external.origin + "/cdn/app.tgz"
+        self.download(["app"], token="fixture-source-token")
+        self.assertTrue(self.source.requests)
+        self.assertEqual(self.source.requests[0]["authorization"], "Bearer fixture-source-token")
+        self.assertTrue(external.requests)
+        self.assertTrue(all(request["authorization"] is None for request in external.requests))
+
+    def test_http_bundle_publishes_offline_without_lock_or_npm_and_sets_latest(self):
+        # The supported current workflow must be independently portable. A
+        # legacy CLI downloader or checkout-level dependency cannot hide here.
+        standalone = self.root / "standalone downloader with spaces"
+        standalone.mkdir()
+        for filename in (DOWNLOADER.name, UPLOADER.name):
+            shutil.copy2(NPM_DIR / filename, standalone / filename)
+        for directory in ("lib", "vendor"):
+            shutil.copytree(NPM_DIR / directory, standalone / directory)
+        self.downloader = standalone / DOWNLOADER.name
+        self.source.add("@fixture/versions", "2.0.0", {"scripts": {"prepublishOnly": "exit 99"}})
+        self.source.add("@fixture/versions", "1.0.0", {"scripts": {"prepublish": "exit 99", "postinstall": "exit 99"}})
+        self.download(["@fixture/versions@2.0.0", "@fixture/versions@1.0.0"], windows_list=True)
+        self.assertFalse((self.output / "package-lock.json").exists())
+        self.source.disabled = True
+        source_count = len(self.source.requests)
+        destination = FixtureRegistry()
+        self.addCleanup(destination.close)
+        destination.force_latest_on_publish = True
+        offline_uploader = self.root / "offline-upload.py"
+        with tarfile.open(self.transfer) as transfer:
+            uploader_member = next(member for member in transfer.getmembers()
+                                   if member.name.endswith("/" + UPLOADER.name) or member.name == UPLOADER.name)
+            offline_uploader.write_bytes(transfer.extractfile(uploader_member).read())
+        result = subprocess.run([
+            sys.executable, str(offline_uploader), "--bundle-tar", str(self.transfer),
+            "--registry-url", destination.url, "--allow-http", "--work-dir", str(self.root / "upload"),
+        ], cwd=self.root, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + "\n" + result.stderr)
+        self.assertEqual(len(self.source.requests), source_count, "Offline publishing must not contact source registry")
+        self.assertEqual(destination.documents["@fixture/versions"]["dist-tags"]["latest"], "2.0.0")
+        self.assertEqual([next(iter(request["payload"]["versions"])) for request in destination.puts], ["1.0.0", "2.0.0"])
+        for request in destination.puts:
+            attachment = next(iter(request["payload"]["_attachments"].values()))
+            metadata = archive_metadata(base64.b64decode(attachment["data"]))
+            self.assertNotIn("scripts", metadata)
+            self.assertNotIn("publishConfig", metadata)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 const { spawnSync } = require('child_process');
 
 function usage() {
@@ -12,6 +13,7 @@ function usage() {
 
 Usage:
   node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version VERSION [options] <package...>
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version VERSION --package-lock FILE [options]
 
 Examples:
   node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 20.11.1 react lodash
@@ -25,6 +27,8 @@ Options:
   --package SPEC              Package spec to add. May be repeated.
   --packages-file FILE        Package list file. May be repeated.
   --package-file FILE         Alias for --packages-file.
+  --package-lock FILE         Fetch the exact dependency tree in a v1/v2/v3 lockfile.
+  --destination-registry URL  Internal registry URL for the rewritten lockfile.
   --update-all                Re-download every package recorded in this node-version state file.
   --registry URL              Source npm registry. Defaults to npm's configured registry.
   --userconfig FILE           npmrc file for source registry auth.
@@ -46,7 +50,7 @@ Options:
                               Do not include optional dependencies in the lockfile.
   --allow-engine-mismatches   Record engines.node mismatches instead of failing.
   --no-normalize-library-package
-                              Keep original npm tarball package.json metadata.
+                              Keep devDependencies; publish blockers are still removed.
   --strip-peer-dependencies   Remove peerDependencies from packed tarball package.json.
   --strip-optional-dependencies
                               Remove optionalDependencies from packed tarball package.json.
@@ -71,6 +75,8 @@ function parseArgs(argv) {
     nodeVersion: '',
     packages: [],
     packagesFiles: [],
+    packageLock: '',
+    destinationRegistry: '',
     updateAll: false,
     registry: '',
     userconfig: '',
@@ -122,6 +128,12 @@ function parseArgs(argv) {
         break;
       case '--update-all':
         options.updateAll = true;
+        break;
+      case '--package-lock':
+        options.packageLock = path.resolve(next());
+        break;
+      case '--destination-registry':
+        options.destinationRegistry = next().replace(/\/+$/, '') + '/';
         break;
       case '--registry':
         options.registry = next();
@@ -203,6 +215,17 @@ function parseArgs(argv) {
 
   if (!Number.isInteger(options.maxVersionProbes) || options.maxVersionProbes < 1) {
     fail('--max-version-probes must be a positive integer');
+  }
+  if (options.packageLock && (options.packages.length || options.packagesFiles.length || options.updateAll
+      || options.omitPeerDependencies || options.omitOptionalDependencies)) {
+    fail('--package-lock cannot be combined with package inputs, --update-all, or --omit-* flags; every locked package is included');
+  }
+  if (options.destinationRegistry) {
+    const destination = new URL(options.destinationRegistry);
+    if (!['http:', 'https:'].includes(destination.protocol) || destination.username || destination.password
+        || destination.search || destination.hash) {
+      fail('--destination-registry must be an HTTP(S) registry URL without credentials, query, or fragment');
+    }
   }
   for (const [flag, value] of [
     ['--target-arch', options.targetArch],
@@ -305,6 +328,14 @@ function packageSpecFromTextLine(line, source) {
   const comma = trimmed.match(/^([^,\s]+)\s*,\s*(.+)$/);
   if (comma) {
     return packageSpecFromNameVersion(comma[1], comma[2], source);
+  }
+
+  // Preserve complete inline ranges such as "react@>=18 <20" and npm aliases.
+  // A leading @ in a scoped name is not a version separator.
+  const firstToken = trimmed.split(/\s+/, 1)[0];
+  const versionAt = firstToken.indexOf('@', firstToken.startsWith('@') ? firstToken.indexOf('/') + 1 : 0);
+  if (versionAt > 0) {
+    return trimmed;
   }
 
   const parts = trimmed.split(/\s+/);
@@ -426,7 +457,8 @@ function npmArgsWithConfig(options) {
 function npmEnv(options) {
   const env = {
     ...process.env,
-    npm_config_engine_strict: 'false'
+    npm_config_engine_strict: 'false',
+    npm_config_ignore_scripts: 'true'
   };
   if (!options.strictSsl) {
     env.npm_config_strict_ssl = 'false';
@@ -834,7 +866,9 @@ function npmInstallLock(projectDir, options) {
   if (options.omitOptionalDependencies) {
     args.push('--omit=optional');
   }
-  runNpm(options, [...args, ...npmArgsWithConfig(options)], { cwd: projectDir });
+  runNpm(options, [...args, ...npmArgsWithConfig(options)], {
+    cwd: projectDir
+  });
 }
 
 function candidateVersionsForLatest(packageName, options) {
@@ -914,32 +948,80 @@ function packageNameFromLockPath(lockPath) {
   return parts[0] || '';
 }
 
-function collectLockPackages(lock) {
-  const packages = lock.packages || {};
+function collectLockPackages(lock, strict = false) {
+  if (strict && ![1, 2, 3].includes(lock.lockfileVersion)) {
+    fail('Unsupported lockfileVersion; --package-lock requires npm lockfile v1, v2, or v3');
+  }
+  const records = new Map();
+  function add(lockPath, meta, fallbackName) {
+    if (!meta || typeof meta !== 'object') fail(`Invalid lockfile entry: ${lockPath}`);
+    let name = meta.name || fallbackName || packageNameFromLockPath(lockPath);
+    let version = String(meta.version || '');
+    const alias = version.match(/^npm:(.+)@([^@]+)$/);
+    if (alias) [, name, version] = alias;
+    if (strict && (meta.link || !/^(?:node_modules\/(?:@[^/]+\/)?[^/]+\/)*node_modules\/(?:@[^/]+\/)?[^/]+$/.test(lockPath)
+        || lockPath.split('/').some((part) => part === '.' || part === '..') || !name || !parseSemver(version))) {
+      fail(`Unsupported local, workspace, git, or non-exact lockfile entry: ${lockPath} (${version})`);
+    }
+    if (!name || !version) return;
+    if (strict && meta.resolved && !/^https?:\/\//i.test(meta.resolved)) {
+      fail(`Unsupported resolved source for ${lockPath}: only HTTP(S) tarballs are supported`);
+    }
+    if (records.has(lockPath)) {
+      const existing = records.get(lockPath);
+      if (existing.name !== name || existing.version !== version) fail(`Inconsistent v2 lockfile entry: ${lockPath}`);
+      if (strict && ((existing.integrity && meta.integrity && existing.integrity !== meta.integrity)
+          || (existing.resolved && meta.resolved && existing.resolved !== meta.resolved))) {
+        fail(`Conflicting sources or integrity in v2 lockfile entry: ${lockPath}`);
+      }
+      existing.lockEntries.push(meta);
+      return;
+    }
+    records.set(lockPath, {
+      name, version, key: `${name}@${version}`, lockPath,
+      resolved: meta.resolved || '', integrity: meta.integrity || '',
+      engines: meta.engines || {}, optional: Boolean(meta.optional), dev: Boolean(meta.dev),
+      inBundle: Boolean(meta.inBundle || meta.bundled), lockEntries: [meta]
+    });
+  }
+  if (lock.packages && typeof lock.packages === 'object') {
+    for (const [lockPath, meta] of Object.entries(lock.packages)) {
+      if (lockPath) add(lockPath, meta);
+    }
+  }
+  function walkLegacy(dependencies, parentPath = '') {
+    for (const [name, meta] of Object.entries(dependencies || {})) {
+      const lockPath = `${parentPath ? `${parentPath}/` : ''}node_modules/${name}`;
+      add(lockPath, meta, name);
+      walkLegacy(meta.dependencies, lockPath);
+    }
+  }
+  if (lock.lockfileVersion === 1 || lock.lockfileVersion === 2) walkLegacy(lock.dependencies);
   const byKey = new Map();
-
-  for (const [lockPath, meta] of Object.entries(packages)) {
-    if (!lockPath || !meta || !meta.version) {
-      continue;
+  for (const record of records.values()) {
+    if (record.inBundle) continue;
+    const existing = byKey.get(record.key);
+    if (existing) {
+      if (strict && (existing.resolved !== record.resolved || existing.integrity !== record.integrity)) {
+        fail(`Conflicting sources or integrity for ${record.key}; one registry version cannot represent both lock entries`);
+      }
+      existing.lockPaths.push(record.lockPath);
+      existing.lockEntries.push(...record.lockEntries);
+    } else {
+      byKey.set(record.key, { ...record, lockPaths: [record.lockPath], bundledPackages: [] });
     }
-    const name = meta.name || packageNameFromLockPath(lockPath);
-    if (!name) {
-      continue;
+  }
+  for (const record of records.values()) {
+    if (!record.inBundle) continue;
+    let ownerPath = record.lockPath;
+    let owner;
+    while (ownerPath.includes('/node_modules/')) {
+      ownerPath = ownerPath.slice(0, ownerPath.lastIndexOf('/node_modules/'));
+      const candidate = records.get(ownerPath);
+      if (candidate && !candidate.inBundle) { owner = candidate; break; }
     }
-    const key = `${name}@${meta.version}`;
-    if (!byKey.has(key)) {
-      byKey.set(key, {
-        name,
-        version: meta.version,
-        key,
-        lockPath,
-        resolved: meta.resolved || '',
-        integrity: meta.integrity || '',
-        engines: meta.engines || {},
-        optional: Boolean(meta.optional),
-        dev: Boolean(meta.dev)
-      });
-    }
+    if (!owner) fail(`Bundled lock entry has no containing package: ${record.lockPath}`);
+    byKey.get(owner.key).bundledPackages.push({ ...record, tarPath: `package/${record.lockPath.slice(ownerPath.length + 1)}/package.json` });
   }
 
   return [...byKey.values()].sort((left, right) => {
@@ -950,9 +1032,53 @@ function collectLockPackages(lock) {
   });
 }
 
+function verifyOriginalIntegrity(file, integrity, label) {
+  if (!integrity) {
+    log(`WARNING: ${label} has no lockfile integrity; only package identity can be verified`);
+    return false;
+  }
+  const strengths = ['sha512', 'sha384', 'sha256', 'sha1'];
+  const tokens = String(integrity).trim().split(/\s+/).map((token) => token.match(/^(sha512|sha384|sha256|sha1)-([A-Za-z0-9+/]+={0,2})(?:\?.*)?$/)).filter(Boolean);
+  const algorithm = strengths.find((candidate) => tokens.some((token) => token[1] === candidate));
+  if (!algorithm) fail(`Unsupported or malformed lockfile integrity for ${label}`);
+  const actual = crypto.createHash(algorithm).update(fs.readFileSync(file)).digest('base64');
+  if (!tokens.some((token) => token[1] === algorithm && token[2] === actual)) {
+    fail(`Original tarball integrity mismatch for ${label}; download rejected before sanitization`);
+  }
+  return true;
+}
+
+function rewriteLockPackage(pkg, integrity, options) {
+  for (const entry of pkg.lockEntries) {
+    entry.integrity = integrity;
+    delete entry.hasInstallScript;
+    if (options.destinationRegistry) {
+      const basename = pkg.name.split('/').pop();
+      entry.resolved = `${options.destinationRegistry}${pkg.name}/-/${basename}-${pkg.version}.tgz`;
+    } else {
+      delete entry.resolved;
+    }
+  }
+  for (const bundled of pkg.bundledPackages) {
+    for (const entry of bundled.lockEntries) {
+      delete entry.hasInstallScript;
+      delete entry.integrity;
+      delete entry.resolved;
+    }
+  }
+}
+
 function safeTarballName(name, version) {
   const safeName = name.replace(/^@/, '').replace(/[\/\\]/g, '-').replace(/[^A-Za-z0-9._-]/g, '-');
-  return `${safeName}-${version}.tgz`;
+  const suffix = crypto.createHash('sha256').update(name).digest('hex').slice(0, 10);
+  return `${safeName}-${version}-${suffix}.tgz`;
+}
+
+function deletePackageJsonField(packageJson, field, removedFields) {
+  if (Object.prototype.hasOwnProperty.call(packageJson, field)) {
+    delete packageJson[field];
+    removedFields.push(field);
+  }
 }
 
 function hashFile(file, algorithm) {
@@ -962,7 +1088,7 @@ function hashFile(file, algorithm) {
 }
 
 function packPackage(pkg, options, rawTarballDir) {
-  const packageRef = `${pkg.name}@${pkg.version}`;
+  const packageRef = options.packageLock && pkg.resolved ? pkg.resolved : `${pkg.name}@${pkg.version}`;
   log(`Packing ${packageRef}`);
   const output = runNpm(options, [
     'pack',
@@ -978,50 +1104,176 @@ function packPackage(pkg, options, rawTarballDir) {
   if (!first || !first.filename) {
     fail(`npm pack did not return a filename for ${packageRef}`);
   }
+  const rawTarball = path.resolve(rawTarballDir, first.filename);
+  if (!rawTarball.startsWith(`${rawTarballDir}${path.sep}`)) fail('npm pack returned an unsafe filename');
   return {
-    rawTarball: path.join(rawTarballDir, first.filename),
+    rawTarball,
     npmPack: first
   };
 }
 
-function normalizeTarball(sourceTarball, outputTarball, options, workRoot) {
-  const extractDir = fs.mkdtempSync(path.join(workRoot, 'normalize-'));
-  run('tar', ['-xzf', sourceTarball, '-C', extractDir]);
+function sanitizePackageJson(packageJson, options) {
+  const removedFields = [];
+  deletePackageJsonField(packageJson, 'scripts', removedFields);
+  deletePackageJsonField(packageJson, 'private', removedFields);
+  deletePackageJsonField(packageJson, 'publishConfig', removedFields);
 
-  const packageJsonFile = path.join(extractDir, 'package', 'package.json');
-  if (!fs.existsSync(packageJsonFile)) {
-    fail(`Tarball does not contain package/package.json: ${sourceTarball}`);
+  if (options.normalizeLibraryPackage) {
+    deletePackageJsonField(packageJson, 'devDependencies', removedFields);
   }
-
-  const packageJson = readJson(packageJsonFile);
-  delete packageJson.scripts;
-  delete packageJson.devDependencies;
   if (options.stripPeerDependencies) {
-    delete packageJson.peerDependencies;
-    delete packageJson.peerDependenciesMeta;
+    deletePackageJsonField(packageJson, 'peerDependencies', removedFields);
+    deletePackageJsonField(packageJson, 'peerDependenciesMeta', removedFields);
   }
   if (options.stripOptionalDependencies) {
-    delete packageJson.optionalDependencies;
+    deletePackageJsonField(packageJson, 'optionalDependencies', removedFields);
   }
-  writeJson(packageJsonFile, packageJson);
-
-  run('tar', ['-czf', outputTarball, '-C', extractDir, 'package']);
+  return removedFields;
 }
 
-function validatePackageTarball(pkg, tarball, workRoot) {
-  const extractDir = fs.mkdtempSync(path.join(workRoot, 'validate-'));
-  run('tar', ['-xzf', tarball, '-C', extractDir]);
+// Inspect/rewrite tar records in memory. Package archives are never extracted and
+// no package lifecycle scripts run. Keeping the original records also preserves
+// file modes while producing repeatable gzip output for identical input bytes.
+function readTarRecords(file) {
+  const data = zlib.gunzipSync(fs.readFileSync(file));
+  const records = [];
+  let pax = {};
+  let paxRecord;
+  let longName = '';
+  let longLink = '';
+  const field = (header, start, length) => header.subarray(start, start + length).toString('utf8').replace(/\0.*$/s, '');
+  for (let offset = 0; offset + 512 <= data.length;) {
+    const header = Buffer.from(data.subarray(offset, offset + 512));
+    if (header.every((byte) => byte === 0)) break;
+    const storedChecksum = parseInt(field(header, 148, 8).trim(), 8);
+    let checksum = 0;
+    for (let i = 0; i < 512; i += 1) checksum += i >= 148 && i < 156 ? 32 : header[i];
+    if (storedChecksum !== checksum) fail(`Invalid tar header checksum in ${file}`);
+    const type = String.fromCharCode(header[156] || 48);
+    const rawSize = field(header, 124, 12).trim();
+    if (!/^[0-7]+$/.test(rawSize)) fail(`Unsupported tar size encoding in ${file}`);
+    let size = parseInt(rawSize, 8);
+    if (!['x', 'g', 'L', 'K'].includes(type) && pax.size !== undefined) size = Number(pax.size);
+    if (!Number.isSafeInteger(size) || size < 0 || offset + 512 + size > data.length) fail(`Truncated tarball: ${file}`);
+    const content = data.subarray(offset + 512, offset + 512 + size);
+    const prefix = field(header, 345, 155);
+    const name = field(header, 0, 100);
+    const record = { header, data: content, type, name: prefix ? `${prefix}/${name}` : name };
+    records.push(record);
+    offset += 512 + Math.ceil(size / 512) * 512;
+    if (type === 'g') fail('Global PAX tar headers are not supported');
+    if (type === 'x') {
+      pax = {};
+      for (let index = 0; index < content.length;) {
+        const space = content.indexOf(32, index);
+        const length = Number(content.subarray(index, space).toString());
+        if (space < 0 || !Number.isInteger(length) || length <= space - index + 1 || index + length > content.length) fail('Invalid PAX tar header');
+        const line = content.subarray(space + 1, index + length - 1).toString('utf8');
+        const equals = line.indexOf('=');
+        if (equals < 1) fail('Invalid PAX tar field');
+        pax[line.slice(0, equals)] = line.slice(equals + 1);
+        index += length;
+      }
+      paxRecord = record;
+      continue;
+    }
+    if (type === 'L') { longName = content.toString('utf8').replace(/\0.*$/s, '').replace(/\n$/, ''); continue; }
+    if (type === 'K') { longLink = content.toString('utf8').replace(/\0.*$/s, '').replace(/\n$/, ''); continue; }
+    record.name = String(pax.path || longName || record.name).replace(/^\.\//, '');
+    if (!record.name.startsWith('package/') || record.name.includes('\\') || record.name.split('/').includes('..')) {
+      fail(`Unsafe or unsupported tar member: ${record.name}`);
+    }
+    if (!['0', '5', '1', '2'].includes(type)) fail(`Unsupported tar member type ${type}: ${record.name}`);
+    if (type === '1' || type === '2') {
+      const target = pax.linkpath || longLink || field(header, 157, 100);
+      const resolved = type === '2' ? path.posix.join(path.posix.dirname(record.name), target) : target;
+      if (target.startsWith('/') || target.includes('\\') || !resolved.startsWith('package/') || resolved.split('/').includes('..')) {
+        fail(`Unsafe tar link: ${record.name}`);
+      }
+    }
+    record.pax = pax;
+    record.paxRecord = paxRecord;
+    pax = {};
+    paxRecord = undefined;
+    longName = '';
+    longLink = '';
+  }
+  const names = new Set();
+  for (const record of records.filter((entry) => !['x', 'L', 'K'].includes(entry.type))) {
+    if (names.has(record.name)) fail(`Duplicate tar member: ${record.name}`);
+    names.add(record.name);
+  }
+  return records;
+}
 
-  const packageJsonFile = path.join(extractDir, 'package', 'package.json');
-  if (!fs.existsSync(packageJsonFile)) {
+function encodePax(pax) {
+  return Buffer.concat(Object.entries(pax).map(([key, value]) => {
+    const body = ` ${key}=${value}\n`;
+    let length = Buffer.byteLength(body) + 1;
+    while (String(length).length + Buffer.byteLength(body) !== length) length = String(length).length + Buffer.byteLength(body);
+    return Buffer.from(`${length}${body}`);
+  }));
+}
+
+function encodeTarRecord(record) {
+  const header = Buffer.from(record.header);
+  header.write(`${record.data.length.toString(8).padStart(11, '0')}\0`, 124, 12, 'ascii');
+  header.fill(32, 148, 156);
+  const checksum = header.reduce((total, byte) => total + byte, 0);
+  header.write(`${checksum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'ascii');
+  return Buffer.concat([header, record.data, Buffer.alloc((512 - record.data.length % 512) % 512)]);
+}
+
+function sanitizeTarballForAirgapPublish(sourceTarball, outputTarball, options) {
+  const records = readTarRecords(sourceTarball);
+  const sanitizedPackages = [];
+  const offlineWarnings = [];
+  let rootFields;
+  let changed = false;
+  for (const record of records) {
+    if (record.name.endsWith('/binding.gyp')) offlineWarnings.push(`${record.name}: npm can implicitly run node-gyp; prebuilt binaries or an offline native build toolchain may be required`);
+    if (!/^package\/(?:node_modules\/(?:@[^/]+\/)?[^/]+\/)*package\.json$/.test(record.name)) continue;
+    if (record.type !== '0') fail(`Package manifest must be a regular file: ${record.name}`);
+    const packageJson = JSON.parse(record.data.toString('utf8'));
+    const installHooks = Object.keys(packageJson.scripts || {}).filter((name) => /^(preinstall|install|postinstall|prepare)$/.test(name));
+    if (installHooks.length) offlineWarnings.push(`${record.name}: removed ${installHooks.join(', ')}; any generated files or downloaded binaries must already be present`);
+    const removedFields = sanitizePackageJson(packageJson, options);
+    if (record.name === 'package/package.json') rootFields = removedFields;
+    sanitizedPackages.push({ path: record.name, removedFields });
+    if (!removedFields.length) continue;
+    changed = true;
+    record.data = Buffer.from(`${JSON.stringify(packageJson, null, 2)}\n`);
+    if (record.paxRecord && Object.prototype.hasOwnProperty.call(record.pax, 'size')) {
+      delete record.pax.size;
+      record.paxRecord.data = encodePax(record.pax);
+    }
+  }
+  if (!rootFields) fail(`Tarball does not contain package/package.json: ${sourceTarball}`);
+  if (changed) {
+    fs.writeFileSync(outputTarball, zlib.gzipSync(Buffer.concat([...records.map(encodeTarRecord), Buffer.alloc(1024)]), { level: 9 }));
+  } else {
+    fs.copyFileSync(sourceTarball, outputTarball);
+  }
+  return { removedFields: rootFields, sanitizedPackages, offlineWarnings };
+}
+
+function validatePackageTarball(pkg, tarball) {
+  const records = readTarRecords(tarball);
+  const root = records.find((record) => record.name === 'package/package.json' && record.type === '0');
+  if (!root) {
     fail(`Packed tarball does not contain package/package.json for ${pkg.key}: ${tarball}`);
   }
-
-  const packageJson = readJson(packageJsonFile);
+  const packageJson = JSON.parse(root.data.toString('utf8'));
   const actualName = String(packageJson.name || '');
   const actualVersion = String(packageJson.version || '');
   if (actualName !== pkg.name || actualVersion !== pkg.version) {
     fail(`Packed tarball mismatch for ${pkg.key}: package/package.json contains ${actualName}@${actualVersion}`);
+  }
+  for (const bundled of pkg.bundledPackages || []) {
+    const record = records.find((entry) => entry.name === bundled.tarPath && entry.type === '0');
+    if (!record) fail(`Missing bundled dependency ${bundled.key} in ${pkg.key}: ${bundled.tarPath}`);
+    const manifest = JSON.parse(record.data.toString('utf8'));
+    if (manifest.name !== bundled.name || manifest.version !== bundled.version) fail(`Bundled dependency identity mismatch: ${bundled.key} in ${pkg.key}`);
   }
 }
 
@@ -1071,23 +1323,30 @@ function writeBundleReadme(bundleDir, options) {
     'This directory is intended to be transported as the single .tar file created by the downloader.',
     '',
     'The npm registry uploader script is maintained separately in the airgapped environment.',
-    'Use upload-npm-artifactory-bundle.sh with this transfer tar, or use packages.json,',
+    'Use upload-npm-artifactory-bundle.py with this transfer tar, or use packages.json,',
     'packages.jsonl, or artifactory-upload-manifest.tsv as custom uploader input.',
     '',
     'Files:',
     '  package.json                    Root requested package set used for resolution.',
     '  package-lock.json               npm lockfile for the resolved offline dependency tree.',
+    '  package-lock.original.json      Original lockfile before sanitized integrity rewriting.',
     '  packages.json                   Machine-readable package/tarball manifest.',
     '  packages.tsv                    Human-readable package/tarball list.',
     '  artifactory-upload-manifest.tsv Tab-separated name/version/tarball manifest.',
     '  tarballs/                       Packed npm tarballs ready to publish.',
     '  state/                          Snapshot of the local per-node-version state file.',
     '',
-    'Every tarball was validated during download to confirm package/package.json',
-    'contains the expected package name and version.',
+    'Every tarball was sanitized before bundling to remove npm publish blockers',
+    'from package/package.json, then validated to confirm the expected package',
+    'name and version.',
+    'The rewritten lockfile uses sanitized tarball integrity. When no destination registry',
+    'was supplied, resolved URLs are omitted so npm uses its configured registry.',
     '',
-    'Tarball package.json files are normalized by default: scripts and devDependencies are removed.',
-    'Runtime fields and dependencies are preserved unless strip flags were used.'
+    'Tarball package.json files are library-normalized by default: devDependencies are removed.',
+    'Runtime fields and dependencies are preserved unless strip flags were used.',
+    'Removed install scripts may have supplied native binaries or generated files.',
+    'See summary.json offlineWarnings; prepare and test such assets before airgap transfer.',
+    'Use npm ci --ignore-scripts with the rewritten lockfile and your internal registry.'
   ];
   fs.writeFileSync(path.join(bundleDir, 'README.txt'), `${lines.join('\n')}\n`);
 }
@@ -1139,7 +1398,7 @@ function main() {
   }
 
   const requests = [...requestsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
-  if (requests.length === 0) {
+  if (requests.length === 0 && !options.packageLock) {
     fail('Provide at least one package, or use --update-all after the state file has requests');
   }
 
@@ -1196,15 +1455,38 @@ function main() {
       }
     }
 
-    writeJson(path.join(projectDir, 'package.json'), makePackageJson(dependencies));
-    log(`Resolving dependency tree for Node ${options.nodeVersion}`);
-    npmInstallLock(projectDir, options);
-
     const lockFile = path.join(projectDir, 'package-lock.json');
+    if (options.packageLock) {
+      fs.copyFileSync(options.packageLock, lockFile);
+      const suppliedLock = readJson(lockFile);
+      const siblingManifest = path.join(path.dirname(options.packageLock), 'package.json');
+      let rootManifest;
+      if (fs.existsSync(siblingManifest)) {
+        rootManifest = readJson(siblingManifest);
+      } else if (suppliedLock.packages && suppliedLock.packages['']) {
+        rootManifest = { ...suppliedLock.packages[''], name: suppliedLock.name || 'offline-lockfile-bundle', version: suppliedLock.version || '0.0.0', private: true };
+      } else {
+        rootManifest = makePackageJson(Object.fromEntries(Object.entries(suppliedLock.dependencies || {}).map(([name, meta]) => [name, meta.version])));
+        log('No adjacent package.json found: generated a manifest from the v1 top-level lock entries; use your original project package.json for installation');
+      }
+      writeJson(path.join(projectDir, 'package.json'), rootManifest);
+      log(`Reading exact packages from ${options.packageLock}; retaining all locked platforms and optional dependencies`);
+    } else {
+      writeJson(path.join(projectDir, 'package.json'), makePackageJson(dependencies));
+      log(`Resolving dependency tree for Node ${options.nodeVersion}`);
+      npmInstallLock(projectDir, options);
+    }
     const lock = readJson(lockFile);
-    const resolvedPackages = collectLockPackages(lock);
+    const resolvedPackages = collectLockPackages(lock, Boolean(options.packageLock));
     if (resolvedPackages.length === 0) {
-      fail('npm produced a lockfile with no resolved packages');
+      fail('Lockfile has no independently resolved packages');
+    }
+    if (options.packageLock) {
+      for (const pkg of resolvedPackages) {
+        for (const lockPath of pkg.lockPaths.filter((value) => value === `node_modules/${packageNameFromLockPath(value)}`)) {
+          rootPackages.push({ name: pkg.name, installName: packageNameFromLockPath(lockPath), requested: pkg.version, spec: pkg.key, resolvedVersion: pkg.version, resolvedSpec: pkg.key });
+        }
+      }
     }
 
     const rootVersionByName = new Map();
@@ -1221,22 +1503,24 @@ function main() {
     const engineReport = validateResolvedEngines(resolvedPackages, options);
 
     fs.copyFileSync(path.join(projectDir, 'package.json'), path.join(bundleDir, 'package.json'));
-    fs.copyFileSync(lockFile, path.join(bundleDir, 'package-lock.json'));
+    fs.copyFileSync(lockFile, path.join(bundleDir, 'package-lock.original.json'));
 
     const manifestItems = [];
     for (const pkg of resolvedPackages) {
       const packed = packPackage(pkg, options, rawTarballDir);
+      const originalIntegrityVerified = options.packageLock
+        ? verifyOriginalIntegrity(packed.rawTarball, pkg.integrity, pkg.key)
+        : false;
       const tarballName = safeTarballName(pkg.name, pkg.version);
       const finalTarball = path.join(tarballDir, tarballName);
 
-      if (options.normalizeLibraryPackage) {
-        normalizeTarball(packed.rawTarball, finalTarball, options, workRoot);
-      } else {
-        fs.copyFileSync(packed.rawTarball, finalTarball);
-      }
+      const sanitization = sanitizeTarballForAirgapPublish(packed.rawTarball, finalTarball, options);
       validatePackageTarball(pkg, finalTarball, workRoot);
 
       const stat = fs.statSync(finalTarball);
+      const integrity = `sha512-${crypto.createHash('sha512').update(fs.readFileSync(finalTarball)).digest('base64')}`;
+      rewriteLockPackage(pkg, integrity, options);
+      for (const warning of sanitization.offlineWarnings) log(`WARNING: ${pkg.key}: ${warning}`);
       manifestItems.push({
         name: pkg.name,
         version: pkg.version,
@@ -1244,15 +1528,22 @@ function main() {
         tarball: path.relative(bundleDir, finalTarball).replace(/\\/g, '/'),
         sha1: hashFile(finalTarball, 'sha1'),
         sha512: hashFile(finalTarball, 'sha512'),
+        integrity,
         bytes: stat.size,
         lockPath: pkg.lockPath,
+        lockPaths: pkg.lockPaths,
         resolved: pkg.resolved,
         registryIntegrity: pkg.integrity,
+        originalIntegrityVerified,
         engines: pkg.engines,
         enginesNode: pkg.enginesNode || '',
         engineCompatible: pkg.engineCompatible,
         engineRangeSupported: pkg.engineRangeSupported,
         normalized: options.normalizeLibraryPackage,
+        publishSanitized: true,
+        publishSanitizedFields: sanitization.removedFields,
+        sanitizedPackages: sanitization.sanitizedPackages,
+        offlineWarnings: sanitization.offlineWarnings,
         packageJsonValidated: true,
         root: rootPackages.some((root) => root.name === pkg.name && root.resolvedVersion === pkg.version),
         optional: pkg.optional,
@@ -1261,6 +1552,7 @@ function main() {
       });
     }
 
+    writeJson(path.join(bundleDir, 'package-lock.json'), lock);
     writeJson(path.join(bundleDir, 'root-packages.json'), rootPackages);
     writeJson(path.join(bundleDir, 'packages.json'), manifestItems);
     fs.writeFileSync(
@@ -1294,6 +1586,7 @@ function main() {
       rootPackages,
       packageCount: manifestItems.length,
       normalized: options.normalizeLibraryPackage,
+      publishSanitized: true,
       engineMismatchCount: engineReport.mismatches.length,
       unsupportedEngineRangeCount: engineReport.unsupported.length
     };
@@ -1314,6 +1607,10 @@ function main() {
     fs.copyFileSync(stateFile, path.join(stateSnapshotDir, path.basename(stateFile)));
 
     const summary = {
+      inputMode: options.packageLock ? 'package-lock' : 'package-list',
+      sourceLockfile: options.packageLock || '',
+      destinationRegistry: options.destinationRegistry || 'npm-config-default',
+      lockfileIntegrityRewritten: true,
       nodeVersion: options.nodeVersion,
       registry: options.registry || 'npm-config-default',
       strictSsl: options.strictSsl,
@@ -1325,12 +1622,14 @@ function main() {
       rootPackageCount: rootPackages.length,
       packageCount: manifestItems.length,
       normalized: options.normalizeLibraryPackage,
+      publishSanitized: true,
       stripPeerDependencies: options.stripPeerDependencies,
       stripOptionalDependencies: options.stripOptionalDependencies,
       engineMismatchCount: engineReport.mismatches.length,
       unsupportedEngineRangeCount: engineReport.unsupported.length,
       engineMismatches: engineReport.mismatches,
       unsupportedEngineRanges: engineReport.unsupported,
+      offlineWarnings: manifestItems.flatMap((item) => item.offlineWarnings.map((warning) => `${item.package}: ${warning}`)),
       rootPackages
     };
     writeJson(path.join(bundleDir, 'summary.json'), summary);
@@ -1349,7 +1648,14 @@ function main() {
   }
 }
 
-module.exports = { resolveNpmInvocation, runNpm };
+// Shared archive operations are also used by the HTTP-only downloader. Importing
+// this module must never launch npm or execute its command-line entry point.
+module.exports = {
+  readPackagesFile, splitPackageSpec, sanitizeTarballForAirgapPublish,
+  validatePackageTarball, readTarRecords, verifyOriginalIntegrity,
+  hashFile, safeTarballName, encodeTarRecord,
+  resolveNpmInvocation, runNpm
+};
 
 if (require.main === module) {
   try {

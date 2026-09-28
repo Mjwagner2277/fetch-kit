@@ -31,6 +31,7 @@ Options:
   --retry-delay-ms N         Delay between publish retries. Defaults to 1000.
   --npm-bin PATH             npm executable. Defaults to npm.
   --npm-flags FLAGS          Extra shell-split flags appended to npm publish.
+                             Package lifecycle scripts are still disabled.
   -h, --help                 Show this help.
 
 latest-policy:
@@ -556,14 +557,15 @@ publish_package() {
   while [[ "$attempts" -lt "$max_attempts" ]]; do
     attempts=$((attempts + 1))
     output_file="${WORK_DIR}/publish-${attempts}.out"
-    local publish_args=(publish "$tarball_path" "${NPM_CONFIG_ARGS[@]}" --tag "$tag" --ignore-scripts)
+    local publish_args=(publish "$tarball_path" "${NPM_CONFIG_ARGS[@]}" --tag "$tag")
     if [[ -n "$NPM_FLAGS" ]]; then
       # shellcheck disable=SC2206
       local extra_flags=( $NPM_FLAGS )
       publish_args+=("${extra_flags[@]}")
     fi
+    publish_args+=(--ignore-scripts=true)
 
-    if "$NPM_BIN" "${publish_args[@]}" > "$output_file" 2>&1; then
+    if npm_config_ignore_scripts=true "$NPM_BIN" "${publish_args[@]}" > "$output_file" 2>&1; then
       cat >> "$PUBLISH_LOG" <<EOF
 [attempt ${attempts}] ${name}@${version} tag=${tag}
 $(cat "$output_file")
@@ -696,6 +698,7 @@ fi
 jq -n \
   --arg registryUrl "$REGISTRY_URL" \
   --argjson strictSsl "$(json_bool "$STRICT_SSL")" \
+  --argjson ignoreScripts true \
   --arg latestPolicy "$LATEST_POLICY" \
   --argjson skipExisting "$(json_bool "$SKIP_EXISTING")" \
   --argjson failOnRemoteQueryError "$(json_bool "$FAIL_ON_REMOTE_QUERY_ERROR")" \
@@ -715,6 +718,7 @@ jq -n \
   '{
     registryUrl: $registryUrl,
     strictSsl: $strictSsl,
+    ignoreScripts: $ignoreScripts,
     latestPolicy: $latestPolicy,
     skipExisting: $skipExisting,
     failOnRemoteQueryError: $failOnRemoteQueryError,
