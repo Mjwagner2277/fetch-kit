@@ -1,6 +1,6 @@
 # npm Artifactory Transfer Bundles
 
-`download-npm-artifactory-bundle.js` uses the local `npm` CLI on an
+`soon-to-be-deprecated/download-npm-artifactory-bundle.js` uses the local `npm` CLI on an
 internet-connected machine to resolve, pack, and stage npm packages for an
 airgapped Artifactory upload process.
 
@@ -8,12 +8,15 @@ The downloader produces one transfer tar per run. The registry uploader is a
 separate Bash script that can be maintained in the airgapped environment and
 consume either the transfer tar or an extracted bundle directory.
 
+The JavaScript downloader is kept in `npm/soon-to-be-deprecated/` while it is
+being retired. Run the examples below from the repository root.
+
 ## Quick Start
 
 Download the latest compatible versions for a target Node.js version:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   react \
   lodash \
@@ -23,7 +26,7 @@ node npm/download-npm-artifactory-bundle.js \
 Download one exact package version for a target Node.js version:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   react@18.2.0
 ```
@@ -31,7 +34,7 @@ node npm/download-npm-artifactory-bundle.js \
 Download a package list for a target Node.js version:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --packages-file packages-node-20.txt
 ```
@@ -39,7 +42,7 @@ node npm/download-npm-artifactory-bundle.js \
 Download for a specific airgapped npm platform:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --target-os linux \
   --target-arch x64 \
@@ -50,7 +53,7 @@ node npm/download-npm-artifactory-bundle.js \
 Download everything already recorded for that same Node.js version:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --update-all
 ```
@@ -58,13 +61,34 @@ node npm/download-npm-artifactory-bundle.js \
 Use a private registry:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --registry "https://registry.example.com/" \
   --token "$NPM_TOKEN" \
   --no-ssl \
   @company/app
 ```
+
+## Windows npm launch errors
+
+On Windows the downloader resolves `npm` or `npm.cmd` to the installation's
+`node_modules/npm/bin/npm-cli.js` and runs it with the current Node executable.
+It does not send package arguments through a command shell. Keep Node.js, npm,
+and `tar` installed on the download machine.
+
+If npm uses a custom wrapper or is outside `PATH`, select its CLI explicitly:
+
+```powershell
+node .\npm\soon-to-be-deprecated\download-npm-artifactory-bundle.js `
+  --node-version 20.11.1 `
+  --npm-bin "C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js" `
+  react
+```
+
+Use the path to the npm installation you intend to run. `NPM_BIN` also accepts
+that path. Relative JavaScript CLI paths are resolved from the directory where
+you start the downloader. Missing launchers produce an actionable `ENOENT`
+message. Custom batch wrappers should be replaced with their npm CLI path.
 
 ## Package Input Files
 
@@ -285,7 +309,7 @@ Use `--target-arch` when the airgapped runtime architecture differs from the
 download machine:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --target-arch arm64 \
   @company/app
@@ -294,7 +318,7 @@ node npm/download-npm-artifactory-bundle.js \
 For Linux targets, prefer setting the full npm platform:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --target-os linux \
   --target-arch arm64 \
@@ -321,7 +345,7 @@ kept, including `main`, `module`, `types`, `exports`, `dependencies`,
 Use these only when your runtime does not need those dependency relationships:
 
 ```bash
-node npm/download-npm-artifactory-bundle.js \
+node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js \
   --node-version 20.11.1 \
   --strip-peer-dependencies \
   --strip-optional-dependencies \
@@ -353,9 +377,18 @@ The hard parts are policy choices, not extraction:
 
 ## Deprecated Workflow
 
-The previous PowerShell-only retriever, GitLab mirror, Bash upload helper, and
-their tests live under:
+The JavaScript downloader, previous PowerShell-only retriever, GitLab mirror,
+Bash upload helper, and legacy tests live under:
 
 ```text
 npm/soon-to-be-deprecated/
+```
+
+## Tests
+
+From the repository root:
+
+```bash
+node npm/tests/test-npm-launcher.js
+node npm/tests/test-download-npm-artifactory-bundle.js
 ```

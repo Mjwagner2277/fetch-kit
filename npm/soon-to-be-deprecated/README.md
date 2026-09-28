@@ -1,4 +1,20 @@
-# PowerShell npm Package Retrieval
+# Legacy npm Retrieval Tools
+
+The JavaScript npm downloader now lives here as
+`download-npm-artifactory-bundle.js`. It is retained while being retired. Run it
+from the repository root:
+
+```powershell
+node .\npm\soon-to-be-deprecated\download-npm-artifactory-bundle.js --node-version 20.11.1 react
+```
+
+On Windows it launches npm's JavaScript CLI through Node, avoiding direct
+`spawnSync npm` / `npm.cmd` failures. For a custom installation, add
+`--npm-bin "C:\Program Files\nodejs\node_modules\npm\bin\npm-cli.js"`
+with the actual CLI path. Node.js, npm, and `tar` are required. See the
+[main npm README](../README.md#windows-npm-launch-errors) for details.
+
+## PowerShell npm Package Retrieval
 
 `Get-NpmPackage.ps1` downloads npm package tarballs and registry dependency
 metadata without calling `npm`, `node`, `npx`, or any JavaScript toolchain. It

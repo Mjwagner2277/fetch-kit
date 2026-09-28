@@ -11,14 +11,14 @@ function usage() {
   console.log(`Download npm packages into an Artifactory-ready offline bundle.
 
 Usage:
-  node npm/download-npm-artifactory-bundle.js --node-version VERSION [options] <package...>
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version VERSION [options] <package...>
 
 Examples:
-  node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 react lodash
-  node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 react@18.2.0
-  node npm/download-npm-artifactory-bundle.js --node-version 18.20.4 --package @storybook/test-runner
-  node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 --packages-file packages.txt
-  node npm/download-npm-artifactory-bundle.js --node-version 20.11.1 --update-all
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 20.11.1 react lodash
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 20.11.1 react@18.2.0
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 18.20.4 --package @storybook/test-runner
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 20.11.1 --packages-file packages.txt
+  node npm/soon-to-be-deprecated/download-npm-artifactory-bundle.js --node-version 20.11.1 --update-all
 
 Options:
   --node-version VERSION       Target Node.js version for engine checks. Required.
@@ -38,7 +38,7 @@ Options:
   --output-dir DIR            Transfer tar output root. Defaults to ./npm-artifactory-cache.
   --tar-file FILE             Exact transfer tar path. Defaults under --output-dir.
   --state-dir DIR             State root. Defaults to ./npm-state.
-  --npm-bin PATH              npm executable. Defaults to npm.
+  --npm-bin PATH              npm executable or npm-cli.js. Defaults to npm.
   --max-version-probes N      Latest-compatible probes per package. Defaults to 50.
   --include-prerelease        Allow prerelease versions when searching latest-compatible.
   --omit-peer-dependencies    Do not include peer dependencies in the lockfile.
@@ -446,15 +446,75 @@ function npmEnv(options) {
   return env;
 }
 
+function resolveNpmInvocation(npmBin) {
+  const isFile = (file) => {
+    try {
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const nodeCli = (file) => ({ command: process.execPath, args: [file] });
+  const isJavaScript = (file) => /\.[cm]?js$/i.test(file);
+  if (isJavaScript(npmBin)) {
+    const cli = path.resolve(npmBin);
+    if (!isFile(cli)) fail(`npm CLI not found: ${cli}. Check --npm-bin or NPM_BIN.`);
+    return nodeCli(cli);
+  }
+  if (process.platform !== 'win32') return { command: npmBin, args: [] };
+
+  // Windows npm.cmd cannot be spawned directly. Find the selected installation
+  // and invoke its CLI through Node so package arguments never pass through cmd.exe.
+  const explicitPath = /[\\/]/.test(npmBin) || path.isAbsolute(npmBin);
+  const pathKey = Object.keys(process.env).sort().find((key) => key.toLowerCase() === 'path');
+  const directories = explicitPath ? [''] : (process.env[pathKey] || '').split(path.delimiter)
+    .map((directory) => directory.replace(/^"(.*)"$/, '$1'));
+  const names = path.extname(npmBin) ? [npmBin]
+    : ['.exe', '.com', '.cmd', '.bat', ''].map((extension) => npmBin + extension);
+  let launcher;
+  for (const directory of directories) {
+    launcher = names.map((name) => path.resolve(directory, name)).find(isFile);
+    if (launcher) break;
+  }
+  if (!launcher) {
+    // The standard Windows Node distribution bundles npm beside node.exe.
+    if (!explicitPath && /^npm(?:\.cmd)?$/i.test(npmBin)) {
+      const bundledCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      if (isFile(bundledCli)) return nodeCli(bundledCli);
+    }
+    fail(`Cannot find npm launcher "${npmBin}" (ENOENT). Install Node.js with npm, add its directory to PATH, or set --npm-bin to the full path to npm-cli.js.`);
+  }
+  if (/\.(exe|com)$/i.test(launcher)) return { command: launcher, args: [] };
+  const realLauncher = fs.realpathSync(launcher);
+  if (isJavaScript(realLauncher)) return nodeCli(realLauncher);
+  if (/^npm(?:\.(cmd|bat))?$/i.test(path.basename(launcher))) {
+    const cli = path.join(path.dirname(realLauncher), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (isFile(cli)) return nodeCli(cli);
+  }
+  fail(`Cannot locate npm-cli.js for "${launcher}". Set --npm-bin to the full path to npm-cli.js in the npm installation you want to use.`);
+}
+
+function runNpm(options, args, runOptions = {}) {
+  const invocation = options.npmInvocation || (options.npmInvocation = resolveNpmInvocation(options.npmBin));
+  return run(invocation.command, [...invocation.args, ...args], { ...runOptions, env: npmEnv(options) });
+}
+
 function run(command, args, options = {}) {
+  const cwd = options.cwd || process.cwd();
   const result = spawnSync(command, args, {
-    cwd: options.cwd || process.cwd(),
+    cwd,
     env: options.env || process.env,
     encoding: 'utf8',
     maxBuffer: 1024 * 1024 * 20
   });
 
   if (result.error) {
+    if (result.error.code === 'ENOENT') {
+      if (!fs.existsSync(cwd)) fail(`Working directory not found: ${cwd}`);
+      const hint = command === 'tar' ? 'Install tar and add it to PATH.'
+        : 'Check that it is installed and on PATH; for npm, set --npm-bin to its executable or npm-cli.js.';
+      fail(`Cannot launch "${command}" (ENOENT). ${hint}`);
+    }
     fail(`${command} failed to start: ${result.error.message}`);
   }
 
@@ -467,9 +527,7 @@ function run(command, args, options = {}) {
 }
 
 function runNpmJson(options, args) {
-  const stdout = run(options.npmBin, [...args, '--json', ...npmArgsWithConfig(options)], {
-    env: npmEnv(options)
-  }).trim();
+  const stdout = runNpm(options, [...args, '--json', ...npmArgsWithConfig(options)]).trim();
   if (!stdout) {
     return null;
   }
@@ -776,10 +834,7 @@ function npmInstallLock(projectDir, options) {
   if (options.omitOptionalDependencies) {
     args.push('--omit=optional');
   }
-  run(options.npmBin, [...args, ...npmArgsWithConfig(options)], {
-    cwd: projectDir,
-    env: npmEnv(options)
-  });
+  runNpm(options, [...args, ...npmArgsWithConfig(options)], { cwd: projectDir });
 }
 
 function candidateVersionsForLatest(packageName, options) {
@@ -909,16 +964,14 @@ function hashFile(file, algorithm) {
 function packPackage(pkg, options, rawTarballDir) {
   const packageRef = `${pkg.name}@${pkg.version}`;
   log(`Packing ${packageRef}`);
-  const output = run(options.npmBin, [
+  const output = runNpm(options, [
     'pack',
     packageRef,
     '--ignore-scripts',
     '--json',
     `--pack-destination=${rawTarballDir}`,
     ...npmArgsWithConfig(options)
-  ], {
-    env: npmEnv(options)
-  });
+  ]);
 
   const parsed = JSON.parse(output);
   const first = Array.isArray(parsed) ? parsed[0] : parsed;
@@ -1296,9 +1349,13 @@ function main() {
   }
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`ERROR: ${error.message}`);
-  process.exit(1);
+module.exports = { resolveNpmInvocation, runNpm };
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`ERROR: ${error.message}`);
+    process.exit(1);
+  }
 }

@@ -8,7 +8,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
-const downloader = path.join(repoRoot, 'npm', 'download-npm-artifactory-bundle.js');
+const downloader = path.join(repoRoot, 'npm', 'soon-to-be-deprecated', 'download-npm-artifactory-bundle.js');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'npm-download-test-'));
 
 function run(command, args, options = {}) {
